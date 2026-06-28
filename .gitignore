@@ -1,0 +1,56 @@
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.Python
+.pytest_cache/
+
+# Node
+node_modules/
+.npm
+.next/
+out/
+dist/
+build/
+.cache/
+
+# Remotion build artifacts
+remotion/out/
+remotion/public/job-*/
+remotion/src/props.json
+
+# Local secrets
+.env
+.env.local
+.env.*.local
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Workdirs / cache
+.cache/video-edit/
+*.workdir/
+broll_plan.source.json
+.polished
+.script_matched
+.render.fp.*
+.followcam.key
+
+# Generated videos (huge files)
+*.preview.mp4
+*.enhanced.mp4
+*.final.mp4
+*.clean.mp4
+*.combined.mp4
+
+# Studio cache / lock
+/tmp/video-edit-render.lock*

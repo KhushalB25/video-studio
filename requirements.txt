@@ -1,0 +1,11 @@
+# Core Python deps for Video Studio
+# Heavy ML deps (whisperx, torch) install separately — see INSTALL section in README
+
+# Image / file utilities
+Pillow>=10.0.0
+
+# HTTP (built-in http.server is used, but anthropic SDK is optional)
+anthropic>=0.40.0   # optional: only needed if you wire LLM-based plan authoring
+
+# Markdown rendering (only used for the spec PDF generator)
+markdown>=3.5
