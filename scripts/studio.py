@@ -358,6 +358,28 @@ def append_chat(sid, role, text, typ="msg"):
     sess.setdefault("chat", []).append({"role": role, "text": text, "type": typ, "ts": time.time()})
 
 
+def queue_path(sid: str) -> Path | None:
+    """Per-session prompt queue, beside the plan in the edit workdir. Claude
+    reads this file to apply natural-language fixes the UI can't do itself."""
+    sess = SESSIONS.get(sid)
+    if not sess: return None
+    wd = Path(sess.get("edit_workdir") or sess.get("workdir") or "")
+    return wd / "prompt_queue.json" if wd else None
+
+
+def enqueue_prompt(sid: str, text: str) -> Path | None:
+    qp = queue_path(sid)
+    if not qp: return None
+    try:
+        queue = json.loads(qp.read_text(encoding="utf-8")) if qp.exists() else []
+    except Exception:
+        queue = []
+    queue.append({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "prompt": text, "consumed": False})
+    qp.parent.mkdir(parents=True, exist_ok=True)
+    qp.write_text(json.dumps(queue, indent=2, ensure_ascii=True), encoding="ascii")
+    return qp
+
+
 # ───────────── Jobs ─────────────
 def job_clean(sid):
     j = SESSIONS[sid]
@@ -450,7 +472,7 @@ def job_edit(sid):
                 if p.is_dir(): shutil.rmtree(p, ignore_errors=True)
                 else: p.unlink(missing_ok=True)
             except Exception: pass
-        env = {"FORCE_RENDER": "1", **dict(os.environ)}
+        env = {"FORCE_RENDER": "1", "ASPECT": SESSIONS[sid].get("aspect", "auto"), **dict(os.environ)}
         r = subprocess.run(["bash", str(RENDER_SH), str(src)], env=env, cwd=str(SKILL),
                            capture_output=True, text=True)
         if r.returncode != 0:
@@ -477,7 +499,7 @@ def job_final(sid):
         cand = Path.home() / "Downloads" / Path(j.get("clean_path") or j["src"]).name
         if cand.exists(): src = cand.resolve()
     try:
-        env = {"QUALITY": "final", "FORCE_RENDER": "1", **dict(os.environ)}
+        env = {"QUALITY": "final", "FORCE_RENDER": "1", "ASPECT": SESSIONS[sid].get("aspect", "auto"), **dict(os.environ)}
         _run(["bash", str(RENDER_SH), str(src)], check=True, env=env, cwd=str(SKILL))
         final = src.parent / f"{src.stem}.enhanced.mp4"
         if final.exists():
@@ -732,7 +754,7 @@ def _just_render(sid: str):
             else: p.unlink(missing_ok=True)
         except Exception: pass
     try:
-        env = {"FORCE_RENDER": "1", **dict(os.environ)}
+        env = {"FORCE_RENDER": "1", "ASPECT": SESSIONS[sid].get("aspect", "auto"), **dict(os.environ)}
         r = subprocess.run(["bash", str(RENDER_SH), str(src)], env=env, cwd=str(SKILL),
                            capture_output=True, text=True)
         if r.returncode != 0:
@@ -966,6 +988,10 @@ input[type=number]{width:64px;background:#0F121A;border:1px solid #343E5B;color:
       <span style="flex:1"></span>
       <button onclick="planUndo()">↶ Undo</button>
       <button onclick="planRedo()">↷ Redo</button>
+      <select id="aspect-sel" title="Output orientation (applies on next render)" onchange="setAspect()">
+        <option value="auto">Orientation: match footage</option>
+        <option value="16:9">Orientation: force 16:9 (pillarbox)</option>
+      </select>
       <button class="primary" onclick="rerender()">Re-render preview</button>
     </div>
     <div class="timeline" id="timeline"><div class="tl-ruler" id="tl-ruler">0s</div></div>
@@ -1648,6 +1674,11 @@ async function sendChat(){
   await fetch('/chat', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({sid, text:t})});
   pollEdit();
 }
+async function setAspect(){
+  if(!sid) return;
+  const aspect = $('aspect-sel').value;
+  await fetch('/aspect', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({sid, aspect})});
+}
 async function openTools(){
   await fetch('/tools/studio', {method:'POST'});
   await fetch('/tools/tuner', {method:'POST'});
@@ -1895,8 +1926,23 @@ class H(BaseHTTPRequestHandler):
             if sid not in SESSIONS: self._json(404, {"error": "no session"}); return
             text = body.get("text", "").strip()
             append_chat(sid, "user", text)
-            append_chat(sid, "assistant", f"Note added. Click **Auto-edit** to regen w/ this feedback.", "msg")
+            qp = enqueue_prompt(sid, text) if text else None
+            if qp:
+                append_chat(sid, "assistant",
+                            f"**Queued for Claude.** In your terminal, tell Claude: "
+                            f"*\"apply the queue for `{qp}`\"* — it'll edit the plan and re-render.", "msg")
+            else:
+                append_chat(sid, "assistant",
+                            "Run **Auto-edit** first so there's a workdir to queue into.", "error")
             self._json(200, {"ok": True}); return
+
+        if u.path == "/aspect":
+            sid = body.get("sid")
+            if sid not in SESSIONS: self._json(404, {"error": "no session"}); return
+            val = body.get("aspect", "auto")
+            if val not in ("auto", "16:9"): val = "auto"
+            SESSIONS[sid]["aspect"] = val
+            self._json(200, {"aspect": val}); return
 
         if u.path == "/export/start":
             sid = body.get("sid")

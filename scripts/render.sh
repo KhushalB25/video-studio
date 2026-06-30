@@ -174,7 +174,47 @@ WIDTH=$(echo "$PROBE_STREAM" | python3 -c "import sys; print(sys.stdin.read().sp
 HEIGHT=$(echo "$PROBE_STREAM" | python3 -c "import sys; print(sys.stdin.read().split(',')[1])")
 FPS=$(echo "$PROBE_STREAM" | python3 -c "import sys; r=sys.stdin.read().split(',')[2].strip(); n,d=r.split('/') if '/' in r else (r,'1'); print(round(int(n)/int(d)))")
 DURATION=$(ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "$VIDEO_PATH")
+
+# Account for display rotation. Phone footage commonly stores landscape pixels
+# with a ±90/270° flag, so the *coded* WIDTH/HEIGHT above are sideways vs what
+# actually plays. ffmpeg auto-rotates on decode (and the proxy pre-pass bakes it
+# in), so the comp must size to the DISPLAYED orientation — swap on ±90/270.
+ROT=$(ffprobe -v error -select_streams v:0 -show_entries stream_side_data=rotation -of default=nw=1:nk=1 "$VIDEO_PATH" 2>/dev/null | head -1)
+[ -z "$ROT" ] && ROT=$(ffprobe -v error -select_streams v:0 -show_entries stream_tags=rotate -of default=nw=1:nk=1 "$VIDEO_PATH" 2>/dev/null | head -1)
+[ -z "$ROT" ] && ROT=$(ffprobe -v error -select_streams v:0 -show_entries side_data=rotation -of default=nw=1:nk=1 "$VIDEO_PATH" 2>/dev/null | head -1)
+if [ "$(python3 -c "print(abs(int(float('${ROT:-0}'))) % 180)" 2>/dev/null)" = "90" ]; then
+  echo "Source carries ${ROT}° rotation → using display orientation (swapping W/H)"
+  _T="$WIDTH"; WIDTH="$HEIGHT"; HEIGHT="$_T"
+fi
 echo "Source: ${WIDTH}x${HEIGHT} @ ${FPS}fps  ${DURATION}s"
+
+# ── ASPECT override (optional pillarbox) ──────────────────────────────
+# Default "auto" = match the footage (portrait stays portrait via the rotation
+# swap above). Set ASPECT=16:9 to force landscape output from portrait footage:
+# we pad the source into a 1920x1080 frame (black bars on the sides) BEFORE
+# Remotion sees it. This keeps the whole subject (no crop) and lets the rest of
+# the pipeline treat it as ordinary landscape — no comp/follow-cam special-case.
+ASPECT="${ASPECT:-auto}"
+case "$ASPECT" in
+  16:9|landscape|pillarbox)
+    if [ "$WIDTH" -lt "$HEIGHT" ]; then
+      PILLAR="$WORKDIR/source_pillarbox.mp4"
+      PKEY="$WORKDIR/.pillarbox.key"
+      PWANT="$(date -r "$VIDEO_PATH" +%s 2>/dev/null || echo 0)"
+      if [ ! -f "$PILLAR" ] || [ "$(cat "$PKEY" 2>/dev/null || true)" != "$PWANT" ]; then
+        echo "==> Pillarboxing portrait source -> 1920x1080 (one-time, cached)"
+        ffmpeg -y -hide_banner -loglevel error -i "$VIDEO_PATH" \
+          -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:-1:-1:color=black,setsar=1" \
+          -c:v libx264 -preset veryfast -crf 18 -c:a aac -b:a 192k "$PILLAR" \
+          && echo "$PWANT" > "$PKEY"
+      fi
+      if [ -f "$PILLAR" ]; then
+        VIDEO_PATH="$PILLAR"; WIDTH=1920; HEIGHT=1080
+        echo "Pillarboxed source -> ${WIDTH}x${HEIGHT} (16:9)"
+      fi
+    fi
+    ;;
+esac
 
 # ── QUALITY mode (preview-by-default for fast iteration) ───────────────
 # preview = 720p comp + 720p source proxy + no audio score + CRF 26 fast preset
@@ -283,6 +323,8 @@ except Exception:
 # the video (fast sparse sampling) — it does NOT need the full speaker matte.
 # The matte (segment_speaker.py, slow) only runs when a behind_subject beat
 # actually needs it.
+# Follow-cam (motion tracking, needs rembg — installed) is the default. Switch
+# to fast zoom punch-ins with CAMERA=zoom when you want quicker renders.
 CAMERA="${CAMERA:-follow}"
 SPEAKER_CUTOUT_REL=""
 if [ "$NEEDS_CUTOUT" = "1" ]; then
