@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 SKILL = Path(__file__).resolve().parent.parent
-VENV_PY = SKILL / ".venv/Scripts/python.exe"
+VENV_PY = SKILL / (".venv/Scripts/python.exe" if os.name == "nt" else ".venv/bin/python3")
 TRANSCRIBE = SKILL / "scripts/transcribe.py"
 RENDER_SH = SKILL / "scripts/render.sh"
 WORK_ROOT = Path.home() / ".cache/video-edit"
@@ -2050,6 +2050,6 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    port = 5000
+    port = int(os.getenv("STUDIO_PORT", "5056"))  # 5000 is taken by macOS AirPlay Receiver
     print(f"Video Studio: http://localhost:{port}")
     HTTPServer(("localhost", port), H).serve_forever()

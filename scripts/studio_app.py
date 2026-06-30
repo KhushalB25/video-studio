@@ -13,7 +13,7 @@ Usage:
     python scripts/studio_app.py
 """
 from __future__ import annotations
-import json, re, shutil, subprocess, sys, time, hashlib, threading
+import json, os, re, shutil, subprocess, sys, time, hashlib, threading
 import urllib.parse, mimetypes
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -22,7 +22,8 @@ SKILL = Path(__file__).resolve().parent.parent
 VENV_PY = SKILL / ".venv/Scripts/python.exe" if sys.platform == "win32" else SKILL / ".venv/bin/python3"
 PROPS = SKILL / "remotion/src/props.json"
 CAP_TSX = SKILL / "remotion/src/templates/Captions.tsx"
-PORT = 5000
+# macOS AirPlay Receiver squats on :5000 (returns 403) — default off it. Override with STUDIO_PORT.
+PORT = int(os.getenv("STUDIO_PORT", "5055"))
 
 VERTICAL_KINDS = {"hook_title", "word_pop", "subscribe", "bar_overlay",
                   "tool_logo_burst", "portrait_burst", "bullet_burst",
