@@ -10,7 +10,7 @@ from __future__ import annotations
 import json, re, hashlib, subprocess, threading, uuid, shutil, time, os, socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 SKILL = Path(__file__).resolve().parent.parent
 VENV_PY = SKILL / (".venv/Scripts/python.exe" if os.name == "nt" else ".venv/bin/python3")
@@ -740,9 +740,12 @@ def list_projects() -> list[dict]:
 
 
 def _just_render(sid: str):
-    """Re-render preview only (no plan regen)."""
+    """Re-render preview only (no plan regen). Disk is the source of truth —
+    reload it so Claude's queue edits (written straight to broll_plan.json)
+    are what gets rendered and snapshotted, not a stale in-memory copy."""
     sess = SESSIONS.get(sid)
     if not sess: return
+    sess["plan"] = load_plan(sid)
     sess["status"] = "edit:rendering"
     src = Path(sess.get("clean_path") or sess["src"]).resolve()
     wd = Path(sess.get("edit_workdir") or sess.get("workdir") or "")
@@ -992,6 +995,7 @@ input[type=number]{width:64px;background:#0F121A;border:1px solid #343E5B;color:
         <option value="auto">Orientation: match footage</option>
         <option value="16:9">Orientation: force 16:9 (pillarbox)</option>
       </select>
+      <button onclick="loadPlan()" title="Pull in edits Claude applied from the prompt queue">⟳ Load Claude's edits</button>
       <button class="primary" onclick="rerender()">Re-render preview</button>
     </div>
     <div class="timeline" id="timeline"><div class="tl-ruler" id="tl-ruler">0s</div></div>
@@ -1352,6 +1356,7 @@ function showCleanError(m){ $('clean-result').classList.remove('hidden'); $('cle
 
 async function runEdit(){
   const p = $('edit-path').value.trim(); if(!p){ alert('Need a clean video path'); return; }
+  if(currentPlan.length && !confirm('Auto-edit regenerates the plan from scratch and discards the current beats (including anything Claude added from the prompt queue). Continue?')) return;
   $('b-edit').disabled=true; $('b-edit').textContent='Editing...';
   if(!sid){
     const r = await fetch('/clean/start', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({src:p, cut_head:false, cut_tail:false, remove_retakes:false, noise_db:-32, min_gap:99, target_gap:0.3})});
@@ -1646,6 +1651,7 @@ async function pollEdit(){
   if(j.chat) renderChat(j.chat);
   if(j.status==='edit:done' || j.status==='edit:error'){
     $('b-edit').disabled=false; $('b-edit').textContent='Re-edit';
+    if(j.status==='edit:done') loadPlan();   // re-sync plan from disk (picks up Claude's queue edits)
     return;
   }
   setTimeout(pollEdit, 1500);
@@ -1827,7 +1833,12 @@ class H(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "video/mp4")
             self.send_header("Content-Length", str(p.stat().st_size))
-            self.send_header("Content-Disposition", f'attachment; filename="{p.name}"')
+            # Header values are latin-1 only; macOS time-stamped names carry
+            # U+202F (narrow no-break space). Give an ASCII fallback + RFC 5987
+            # UTF-8 name so browsers still get the real filename.
+            ascii_name = p.name.encode("ascii", "ignore").decode("ascii") or "download"
+            self.send_header("Content-Disposition",
+                             f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(p.name)}")
             self.end_headers()
             with p.open("rb") as f: shutil.copyfileobj(f, self.wfile)
             return
@@ -1930,7 +1941,8 @@ class H(BaseHTTPRequestHandler):
             if qp:
                 append_chat(sid, "assistant",
                             f"**Queued for Claude.** In your terminal, tell Claude: "
-                            f"*\"apply the queue for `{qp}`\"* — it'll edit the plan and re-render.", "msg")
+                            f"*\"apply the queue for `{qp}`\"*. When it's done, click "
+                            f"**⟳ Load Claude's edits**, then **Re-render preview**.", "msg")
             else:
                 append_chat(sid, "assistant",
                             "Run **Auto-edit** first so there's a workdir to queue into.", "error")
