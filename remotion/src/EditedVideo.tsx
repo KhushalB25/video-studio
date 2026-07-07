@@ -52,6 +52,21 @@ import { OrgDiagram, type OrgDiagramNode } from "./templates/OrgDiagram";
 import { ClaudeCodeTerminal, type ClaudeCodeLine } from "./templates/ClaudeCodeTerminal";
 import { InlineChart } from "./templates/InlineChart";
 import { RatioDots } from "./templates/RatioDots";
+import { RingChart, type RingChartSegment } from "./templates/RingChart";
+import { CountdownReveal } from "./templates/CountdownReveal";
+import { FxLayer, type FxName } from "./templates/FxLayer";
+import { LogoRevealHero } from "./templates/LogoRevealHero";
+import { LogoRevealStyle } from "./templates/LogoRevealStyle";
+import { ImageCompareSlider } from "./templates/ImageCompareSlider";
+import { EndCard } from "./templates/EndCard";
+import { GalleryGrid } from "./templates/GalleryGrid";
+import { ImageCarousel } from "./templates/ImageCarousel";
+import { ImageZoomReveal } from "./templates/ImageZoomReveal";
+import { MasonryGallery } from "./templates/MasonryGallery";
+import { PhotoStack } from "./templates/PhotoStack";
+import { PictureInPicture } from "./templates/PictureInPicture";
+import { PolaroidFrame } from "./templates/PolaroidFrame";
+import { SplitPanels } from "./templates/SplitPanels";
 import { DashboardCard, type DashboardStat } from "./templates/DashboardCard";
 import { ComparisonGrid, type ComparisonGridColumn, type ComparisonGridRow } from "./templates/ComparisonGrid";
 import { BarChart, type BarChartItem } from "./templates/BarChart";
@@ -65,6 +80,22 @@ import { CornerStat } from "./templates/CornerStat";
 import { SidePanel, type SidePanelItem } from "./templates/SidePanel";
 import { Captions, type CaptionLine } from "./templates/Captions";
 import { DarkGridBg } from "./templates/Backgrounds";
+import { AreaChart } from "./templates/AreaChart";
+import { ProgressBars } from "./templates/ProgressBars";
+import { StatCounter } from "./templates/StatCounter";
+import { ComparisonBars } from "./templates/ComparisonBars";
+import { CircularProgress } from "./templates/CircularProgress";
+import { BounceTitle } from "./templates/BounceTitle";
+import { BubblePopText } from "./templates/BubblePopText";
+import { PopText } from "./templates/PopText";
+import { PulseText } from "./templates/PulseText";
+import { TextHighlightSweep } from "./templates/TextHighlightSweep";
+import { TypewriterText } from "./templates/TypewriterText";
+import { ListReveal, type ListRevealItem } from "./templates/ListReveal";
+import { CardFlip } from "./templates/CardFlip";
+import { NotificationStack, type NotificationStackItem } from "./templates/NotificationStack";
+import { Carousel3D, type Carousel3DItem } from "./templates/Carousel3D";
+import { SoundWave } from "./templates/SoundWave";
 
 const resolveSrc = (s: string): string => /^https?:\/\//i.test(s) ? s : staticFile(s);
 
@@ -75,6 +106,9 @@ export type BRoll = {
   reason?: string;
   /** For static/icon/video: file path. Not used for "list". */
   image_path?: string;
+  /** Optional visual treatment layered on top of this beat's own kind —
+   *  see FxName in ./templates/FxLayer. Independent of `kind`. */
+  fx?: FxName;
   /**
    *  Existing legacy kinds:
    *  "static"            full-screen image takeover (default)
@@ -146,7 +180,37 @@ export type BRoll = {
     | "network_spread"
     | "command_deck"
     | "calendar_months"
-    | "layer_stack";
+    | "layer_stack"
+    | "ring_chart"
+    | "countdown_reveal"
+    | "logo_reveal_hero"
+    | "logo_reveal_style"
+    | "image_compare_slider"
+    | "end_card"
+    | "gallery_grid"
+    | "image_carousel"
+    | "image_zoom_reveal"
+    | "masonry_gallery"
+    | "photo_stack"
+    | "picture_in_picture"
+    | "polaroid_frame"
+    | "split_panels"
+    | "area_chart"
+    | "progress_bars"
+    | "stat_delta"
+    | "comparison_bars"
+    | "circular_progress"
+    | "bounce_title"
+    | "bubble_pop_text"
+    | "pop_text"
+    | "pulse_text"
+    | "text_sweep"
+    | "typewriter_text"
+    | "list_reveal"
+    | "card_flip"
+    | "notification_stack"
+    | "carousel_3d"
+    | "sound_wave";
   /** For icon kind: where to anchor it. Default "center" (true vertical+horizontal center). */
   anchor?: "center" | "top-left" | "top-right" | "top-center" | "bottom-left" | "bottom-right";
   /** For icon kind: scale factor relative to frame width (0.0–1.0). Default 0.65 for center, 0.55 for corners. */
@@ -330,6 +394,30 @@ export type BRoll = {
    *  speaker — the premium "text-behind-subject" look. Requires a
    *  speakerCutoutSrc to be present; no-op without it. */
   behind_subject?: boolean;
+
+  /** area_chart: labeled trend points (min 2). */
+  chart_points?: { label: string; value: number }[];
+  /** comparison_bars: before/after rows. */
+  comparison_rows?: { label: string; before: number; after: number; max?: number }[];
+  /** circular_progress: 0-100 fill value. */
+  value_pct?: number;
+  /** stat_delta: delta chip beside the count-up (reuses target/prefix/suffix/
+   *  decimals/duration_sec/pre_label from metric_reveal). */
+  delta_value?: string;
+  delta_direction?: "up" | "down";
+  delta_label?: string;
+  /** card_flip: front/back faces + optional labels + flip timing. */
+  front_text?: string;
+  back_text?: string;
+  front_label?: string;
+  back_label?: string;
+  flip_sec?: number;
+  /** notification_stack: multiple stacked toasts. */
+  notifications?: NotificationStackItem[];
+  /** carousel_3d: ring of orbiting cards. */
+  carousel_items?: Carousel3DItem[];
+  /** sound_wave: bar count for the waveform visualizer. */
+  bar_count?: number;
 };
 
 export type ZoomMoment = {
@@ -929,7 +1017,30 @@ const TAKEOVER_KINDS = new Set<string>([
   "command_deck",
   "calendar_months",
   "layer_stack",
+  "countdown_reveal",
+  "logo_reveal_hero",
+  "logo_reveal_style",
+  "end_card",
+  "gallery_grid",
+  "image_carousel",
+  "image_zoom_reveal",
+  "masonry_gallery",
+  "photo_stack",
+  "picture_in_picture",
+  "polaroid_frame",
+  "split_panels",
+  "area_chart",
+  "progress_bars",
+  "stat_delta",
+  "comparison_bars",
+  "bounce_title",
+  "list_reveal",
+  "card_flip",
+  "carousel_3d",
   // notification_toast is partial overlay — speaker stays visible. NOT a takeover.
+  // ring_chart and image_compare_slider are ALSO partial (mid-frame / bottom-
+  // half card, speaker visible) — deliberately excluded, same as bar_overlay
+  // and image_card.
 ]);
 
 /**
@@ -1028,8 +1139,17 @@ export const EditedVideo: React.FC<EditedVideoProps> = ({
     "tool_logo_burst",
     "agent_avatar_burst",
     "ratio_dots",
+    "ring_chart",
     "icon",
     "static",
+    "circular_progress",
+    "bubble_pop_text",
+    "pop_text",
+    "pulse_text",
+    "text_sweep",
+    "typewriter_text",
+    "notification_stack",
+    "sound_wave",
   ]);
 
   // SMART caption suppression (May 23 2026):
@@ -1083,6 +1203,26 @@ export const EditedVideo: React.FC<EditedVideoProps> = ({
     (b.steps ?? []).forEach((s: any) => { push(s?.heading); push(s?.description); });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (b.bars ?? []).forEach((bar: any) => { push(bar?.label); push(bar?.display); });
+    push(b.name); push(b.tagline); push(b.cta); push(b.style);
+    push(b.before_label); push(b.after_label);
+    push(b.centerValue); push(b.centerLabel);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (b.segments ?? []).forEach((s: any) => push(s?.label));
+    push(b.left_label); push(b.right_label); push(b.pip_label);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (b.labels ?? []).forEach((l: unknown) => push(l));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (b.captions ?? []).forEach((c: unknown) => push(c));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (b.chart_points ?? []).forEach((p: any) => push(p?.label));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (b.comparison_rows ?? []).forEach((r: any) => push(r?.label));
+    push(b.delta_value); push(b.delta_label);
+    push(b.front_text); push(b.back_text); push(b.front_label); push(b.back_label);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (b.notifications ?? []).forEach((n: any) => { push(n?.title); push(n?.body); push(n?.app_name); });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (b.carousel_items ?? []).forEach((c: any) => push(c?.label));
     return parts.join(" ");
   };
   const beatWords: Set<string>[] = broll.map((b) => new Set(tokenize(beatTextOf(b))));
@@ -1262,6 +1402,112 @@ export const EditedVideo: React.FC<EditedVideoProps> = ({
                 vertical={b.vertical}
                 columns={(b as unknown as { columns?: number }).columns}
                 beat_start_sec={b.start_sec}
+              />
+            )}
+            {kind === "ring_chart" && (
+              <RingChart
+                segments={((b as unknown as { segments?: RingChartSegment[] }).segments ?? [])}
+                holeRatio={(b as unknown as { holeRatio?: number }).holeRatio}
+                centerValue={(b as unknown as { centerValue?: string }).centerValue}
+                centerLabel={(b as unknown as { centerLabel?: string }).centerLabel}
+                title={b.title}
+                vertical={b.vertical}
+                beat_start_sec={b.start_sec}
+              />
+            )}
+            {kind === "countdown_reveal" && (
+              <CountdownReveal
+                steps={(b as unknown as { steps?: string[] }).steps}
+                subtitle={(b as unknown as { subtitle?: string }).subtitle}
+                beat_start_sec={b.start_sec}
+                beat_end_sec={b.end_sec}
+              />
+            )}
+            {kind === "logo_reveal_hero" && (
+              <LogoRevealHero
+                image_path={b.image_path ?? ""}
+                name={(b as unknown as { name?: string }).name}
+                tagline={(b as unknown as { tagline?: string }).tagline}
+                beat_start_sec={b.start_sec}
+              />
+            )}
+            {kind === "logo_reveal_style" && (
+              <LogoRevealStyle
+                image_path={b.image_path ?? ""}
+                name={(b as unknown as { name?: string }).name}
+                tagline={(b as unknown as { tagline?: string }).tagline}
+                style={(b as unknown as { style?: "blur" | "bounce" | "fade" | "glitch" | "scale_rotate" | "split" | "stroke_draw" | "typewriter" }).style}
+                beat_start_sec={b.start_sec}
+              />
+            )}
+            {kind === "image_compare_slider" && (
+              <ImageCompareSlider
+                before_image={(b as unknown as { before_image?: string }).before_image ?? ""}
+                after_image={(b as unknown as { after_image?: string }).after_image ?? ""}
+                before_label={(b as unknown as { before_label?: string }).before_label}
+                after_label={(b as unknown as { after_label?: string }).after_label}
+                beat_start_sec={b.start_sec}
+              />
+            )}
+            {kind === "end_card" && (
+              <EndCard
+                title={b.title ?? ""}
+                subtitle={(b as unknown as { subtitle?: string }).subtitle}
+                cta={(b as unknown as { cta?: string }).cta}
+                beat_start_sec={b.start_sec}
+              />
+            )}
+            {kind === "gallery_grid" && (
+              <GalleryGrid
+                images={(b as unknown as { images?: string[] }).images ?? []}
+                caption={b.caption}
+              />
+            )}
+            {kind === "image_carousel" && (
+              <ImageCarousel
+                images={(b as unknown as { images?: string[] }).images ?? []}
+                labels={(b as unknown as { labels?: string[] }).labels}
+                slot_sec={(b as unknown as { slot_sec?: number }).slot_sec}
+              />
+            )}
+            {kind === "image_zoom_reveal" && (
+              <ImageZoomReveal
+                image={b.image_path ?? ""}
+                caption={b.caption}
+              />
+            )}
+            {kind === "masonry_gallery" && (
+              <MasonryGallery
+                images={(b as unknown as { images?: string[] }).images ?? []}
+                caption={b.caption}
+              />
+            )}
+            {kind === "photo_stack" && (
+              <PhotoStack
+                images={(b as unknown as { images?: string[] }).images ?? []}
+                captions={(b as unknown as { captions?: string[] }).captions}
+              />
+            )}
+            {kind === "picture_in_picture" && (
+              <PictureInPicture
+                main_image={(b as unknown as { main_image?: string }).main_image ?? ""}
+                pip_image={(b as unknown as { pip_image?: string }).pip_image ?? ""}
+                pip_label={(b as unknown as { pip_label?: string }).pip_label}
+                pip_corner={(b as unknown as { pip_corner?: "bottom-right" | "bottom-left" | "top-right" | "top-left" }).pip_corner}
+              />
+            )}
+            {kind === "polaroid_frame" && (
+              <PolaroidFrame
+                image={b.image_path ?? ""}
+                caption={b.caption}
+              />
+            )}
+            {kind === "split_panels" && (
+              <SplitPanels
+                left_image={(b as unknown as { left_image?: string }).left_image ?? ""}
+                right_image={(b as unknown as { right_image?: string }).right_image ?? ""}
+                left_label={(b as unknown as { left_label?: string }).left_label}
+                right_label={(b as unknown as { right_label?: string }).right_label}
               />
             )}
             {kind === "inline_chart" && (
@@ -1480,6 +1726,114 @@ export const EditedVideo: React.FC<EditedVideoProps> = ({
                 beat_start_sec={b.start_sec}
               />
             )}
+            {kind === "area_chart" && (
+              <AreaChart
+                points={b.chart_points ?? []}
+                title={b.title}
+                caption={b.caption}
+                vertical={b.vertical}
+                beat_start_sec={b.start_sec}
+              />
+            )}
+            {kind === "progress_bars" && (
+              <ProgressBars
+                bars={((b.bars ?? []) as unknown as { label: string; value: number; max?: number }[])}
+                title={b.title}
+                beat_start_sec={b.start_sec}
+              />
+            )}
+            {kind === "stat_delta" && (
+              <StatCounter
+                pre_label={b.pre_label}
+                prefix={b.callout_prefix /* re-use prefix slot for $/ + */}
+                target={b.target ?? 0}
+                suffix={b.callout_suffix /* re-use suffix slot for k/% etc */}
+                decimals={b.decimals}
+                duration_sec={b.duration_sec}
+                delta_value={b.delta_value ?? ""}
+                delta_direction={b.delta_direction}
+                delta_label={b.delta_label}
+                beat_start_sec={b.start_sec}
+              />
+            )}
+            {kind === "comparison_bars" && (
+              <ComparisonBars
+                rows={b.comparison_rows ?? []}
+                before_label={b.before_label}
+                after_label={b.after_label}
+                title={b.title}
+                beat_start_sec={b.start_sec}
+              />
+            )}
+            {kind === "circular_progress" && (
+              <CircularProgress
+                value={b.value_pct ?? 0}
+                label={b.title}
+                caption={b.caption}
+                vertical={b.vertical}
+                beat_start_sec={b.start_sec}
+              />
+            )}
+            {kind === "bounce_title" && (
+              <BounceTitle title={b.title ?? ""} subtitle={b.subtitle} beat_start_sec={b.start_sec} />
+            )}
+            {kind === "bubble_pop_text" && (
+              <BubblePopText text={b.quote_text ?? ""} vertical={b.vertical} beat_start_sec={b.start_sec} />
+            )}
+            {kind === "pop_text" && (
+              <PopText text={b.quote_text ?? ""} vertical={b.vertical} beat_start_sec={b.start_sec} />
+            )}
+            {kind === "pulse_text" && (
+              <PulseText text={b.quote_text ?? ""} vertical={b.vertical} beat_start_sec={b.start_sec} />
+            )}
+            {kind === "text_sweep" && (
+              <TextHighlightSweep text={b.quote_text ?? ""} beat_start_sec={b.start_sec} />
+            )}
+            {kind === "typewriter_text" && (
+              <TypewriterText
+                text={b.quote_text ?? ""}
+                chars_per_second={b.chars_per_second}
+                vertical={b.vertical}
+                beat_start_sec={b.start_sec}
+              />
+            )}
+            {kind === "list_reveal" && (
+              <ListReveal
+                items={(b.items ?? []).map((it): ListRevealItem =>
+                  typeof it === "string" ? { text: it } : { text: it.text, appear_sec: it.appear_sec },
+                )}
+                title={b.title}
+                beat_start_sec={b.start_sec}
+              />
+            )}
+            {kind === "card_flip" && (
+              <CardFlip
+                front_text={b.front_text ?? ""}
+                back_text={b.back_text ?? ""}
+                front_label={b.front_label}
+                back_label={b.back_label}
+                flip_sec={b.flip_sec}
+                beat_start_sec={b.start_sec}
+              />
+            )}
+            {kind === "notification_stack" && (
+              <NotificationStack notifications={b.notifications ?? []} beat_start_sec={b.start_sec} />
+            )}
+            {kind === "carousel_3d" && (
+              <Carousel3D items={b.carousel_items ?? []} title={b.title} beat_start_sec={b.start_sec} />
+            )}
+            {kind === "sound_wave" && (
+              <SoundWave
+                caption={b.caption}
+                bar_count={b.bar_count}
+                vertical={b.vertical}
+                beat_start_sec={b.start_sec}
+              />
+            )}
+            {/* Optional per-beat visual treatment, layered on top of whatever
+                kind rendered above. Independent of `kind` — any beat can
+                carry an `fx` field. */}
+            {b.fx && <FxLayer fx={b.fx} />}
           </Sequence>
         );
       })}

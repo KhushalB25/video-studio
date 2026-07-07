@@ -16,9 +16,16 @@ Idempotent: items that already have `appear_sec` set are left untouched.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
+
+
+def write_json_atomic(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 STOPWORDS = {
     "the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "for",
@@ -141,7 +148,7 @@ def sync(plan_path: Path, words_path: Path) -> int:
                 b["end_sec"] = round(needed_end, 2)
                 extended += 1
 
-    plan_path.write_text(json.dumps(plan, indent=2) + "\n")
+    write_json_atomic(plan_path, json.dumps(plan, indent=2) + "\n")
     print(f"pinned {changed} list items in {plan_path}" + (f" (+{extended} list end_sec extended for dwell)" if extended else ""))
     return 0
 

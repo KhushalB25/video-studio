@@ -4,7 +4,7 @@ Slider + text input. Writes to props.json + captions_plan.json + Captions.tsx de
 Studio (3001) HMR-reloads on each change.
 """
 from __future__ import annotations
-import json, re, urllib.parse
+import json, os, re, urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -12,7 +12,24 @@ SKILL = Path(__file__).resolve().parent.parent
 PROPS = SKILL / "remotion/src/props.json"
 CAP_TSX = SKILL / "remotion/src/templates/Captions.tsx"
 
-WORKDIR = Path(r"C:/Users/DELL/.cache/video-edit/WhatsApp Video 2026-06-27_95d5f8227b38")
+
+def _resolve_workdir() -> Path:
+    """Video Studio passes the active session's workdir via env var when it
+    launches this process. Standalone runs (no env var) fall back to the most
+    recently modified workdir that actually has a plan in it, so double-clicking
+    this script alone still does something sane instead of pointing at a
+    stranger's leftover test video."""
+    env = os.environ.get("VIDEO_STUDIO_WORKDIR")
+    if env and Path(env).exists():
+        return Path(env)
+    cache_root = Path.home() / ".cache/video-edit"
+    candidates = [p.parent for p in cache_root.glob("*/broll_plan.json")]
+    if candidates:
+        return max(candidates, key=lambda p: (p / "broll_plan.json").stat().st_mtime)
+    return cache_root  # empty fallback — /plan endpoints will just show nothing
+
+
+WORKDIR = _resolve_workdir()
 PLAN = WORKDIR / "broll_plan.json"
 SOURCE = WORKDIR / "broll_plan.source.json"
 CAPS = WORKDIR / "captions_plan.json"
@@ -336,5 +353,6 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print("Position tuner: http://localhost:5050")
-    HTTPServer(("localhost", 5050), H).serve_forever()
+    port = int(os.environ.get("TUNER_PORT", "5058"))
+    print(f"Position tuner: http://localhost:{port}")
+    HTTPServer(("localhost", port), H).serve_forever()

@@ -14,8 +14,15 @@ Idempotent.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
+
+
+def write_json_atomic(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 MAX_GAP = 1.5  # seconds. Owner directive 2026-05-29: a visual that pops off,
                # shows the speaker for ~0.5-1s, then another visual pops on
@@ -83,7 +90,7 @@ def close(plan_path: Path) -> int:
             closed += 1
             print(f"  closed {gap:.2f}s gap: beat at {a['start_sec']}s now ends at {start_b}s")
 
-    plan_path.write_text(json.dumps(plan, indent=2) + "\n")
+    write_json_atomic(plan_path, json.dumps(plan, indent=2) + "\n")
     print(f"closed {closed} micro-gap(s) in {plan_path}")
     return 0
 

@@ -7,17 +7,57 @@ One server. Three phases via tabs:
   EXPORT — final 1080p render + download
 """
 from __future__ import annotations
-import json, re, hashlib, subprocess, threading, uuid, shutil, time, os, socket
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import json, re, hashlib, subprocess, threading, uuid, shutil, time, os, socket, sys
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote
+
+# Windows' default console codepage (cp1252) can't represent the unicode
+# (→, ✓, emoji) every pipeline script prints in its status lines. Set this
+# in OUR OWN process env so every subprocess we spawn — render.sh, transcribe.py,
+# fetch_logo.py, all of them — inherits it automatically, regardless of how
+# they're invoked. Hit this exact crash class repeatedly; fixing it once here
+# instead of chasing it into more individual scripts.
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 SKILL = Path(__file__).resolve().parent.parent
 VENV_PY = SKILL / (".venv/Scripts/python.exe" if os.name == "nt" else ".venv/bin/python3")
 TRANSCRIBE = SKILL / "scripts/transcribe.py"
 RENDER_SH = SKILL / "scripts/render.sh"
+
+
+def _resolve_bash() -> str:
+    """render.sh needs GIT BASH, not the bare "bash" on PATH. On Windows,
+    C:\\Windows\\System32\\bash.exe is a WSL launcher stub — if it resolves
+    before Git's bin (which happens when this process is started via the
+    desktop shortcut instead of a dev shell), every render fails with
+    "wsl: Failed to translate ..." because WSL tries to mount-translate
+    Windows env vars that mean nothing inside a Linux VM. Explicitly prefer
+    known Git Bash install locations before falling back to PATH lookup."""
+    if os.name != "nt":
+        return "bash"
+    for candidate in (
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+    ):
+        if Path(candidate).exists():
+            return candidate
+    # PATH fallback, but skip the WSL stub under System32 if it's what PATH finds
+    found = shutil.which("bash")
+    if found and "system32" not in found.lower():
+        return found
+    return "bash"  # last resort — will surface the WSL error clearly if hit
+
+
+BASH = _resolve_bash()
 WORK_ROOT = Path.home() / ".cache/video-edit"
 WORK_ROOT.mkdir(parents=True, exist_ok=True)
+PROJECTS_DIR = WORK_ROOT / "projects"
+PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+
+REMOTION_STUDIO_PORT = 5057
+TUNER_PORT = 5058
 
 SESSIONS: dict[str, dict] = {}
 
@@ -25,7 +65,7 @@ SESSIONS: dict[str, dict] = {}
 def _run(cmd, **kw): return subprocess.run(cmd, **kw)
 
 
-def combine_clips(paths: list[str], dest: Path) -> Path:
+def combine_clips(paths: list[str], dest: Path, sess=None) -> Path:
     """Concat multiple raw clips into one mp4. Uses filter_complex concat so
     differing resolutions / framerates are normalized.  Returns dest path."""
     if len(paths) == 1:
@@ -46,7 +86,10 @@ def combine_clips(paths: list[str], dest: Path) -> Path:
             "-map", "[outv]", "-map", "[outa]",
             "-c:v", "libx264", "-preset", "fast", "-crf", "20",
             "-c:a", "aac", "-b:a", "192k", str(dest)]
-    _run(cmd, check=True)
+    # Same full-video re-encode as stabilize/camera_movement/splice — same
+    # looks-frozen-with-no-feedback bug on multiple/long clips.
+    total_sec = sum(probe_duration(Path(p)) for p in paths)
+    run_ffmpeg_progress(cmd, str(dest.parent), total_sec, sess, f"Combining {len(paths)} clips")
     return dest
 
 
@@ -57,16 +100,62 @@ def workdir_for(src: Path) -> Path:
     return d
 
 
+def edit_workdir_for(sess: dict) -> Path:
+    """Prefer an explicitly-set edit_workdir (a loaded project snapshot's
+    workdir was physically copied to a project-local path that can't be
+    re-derived from clean_path) — otherwise always COMPUTE workdir_for the
+    clean video, rather than falling back to sess["workdir"] (the Clean
+    stage's own transcribe workdir, hashed from the PRE-cut source path —
+    a different directory entirely). That wrong fallback silently required
+    job_edit() ("Auto-edit") to actually run once — the only place that used
+    to set edit_workdir — before /chat, /plan/*, or /plan/render worked at
+    all: sending a chat prompt or loading a hand-authored plan before ever
+    clicking Auto-edit wrote prompt_queue.json / read broll_plan.json from
+    the WRONG directory, and Final export rendered against a stale one too.
+    Computing it fresh here means the Clean stage's own pre-seeded
+    words.json (see keep_transcript_cache_fresh) is immediately reachable —
+    a plan can be authored straight from the transcript with no heuristic
+    Auto-edit pass or its throwaway first render ever required."""
+    if sess.get("edit_workdir"):
+        return Path(sess["edit_workdir"])
+    return workdir_for(Path(sess.get("clean_path") or sess["src"]))
+
+
+def keep_transcript_cache_fresh(out: Path):
+    """clean.mp4 (`out`) can be rewritten AFTER job_clean_finish already
+    pre-seeded words.json into workdir_for(out) — job_audio_only_finish's
+    audio-only reclean and job_apply_camera_effects both call
+    apply_audio_filter() again later, which rewrites `out` and bumps its
+    mtime. Neither changes word timings at all (audio filters and
+    stabilize/camera_movement are video/audio processing, not cuts), but the
+    bumped mtime on `out` alone was enough to fail transcribe()'s
+    `words.json mtime >= src mtime` freshness check — silently forcing a
+    full whisper re-transcription on the next Edit run, discarding whatever
+    the user corrected in the transcript editor. Touching words.json's own
+    mtime here keeps the cache hit valid without re-deriving anything."""
+    words_json = workdir_for(out) / "words.json"
+    if words_json.exists():
+        os.utime(words_json, None)
+
+
 def probe_duration(src: Path) -> float:
     r = _run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-              "-of", "default=nw=1:nk=1", str(src)], capture_output=True, text=True)
+              "-of", "default=nw=1:nk=1", str(src)], capture_output=True, text=True, encoding="utf-8", errors="replace")
     return float(r.stdout.strip())
+
+
+def probe_dimensions(src: Path) -> tuple[int, int]:
+    r = _run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+              "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", str(src)],
+             capture_output=True, text=True, encoding="utf-8", errors="replace")
+    w, h = r.stdout.strip().split("x")
+    return int(w), int(h)
 
 
 def detect_silences(src: Path, noise_db: float, min_gap: float):
     r = _run(["ffmpeg", "-i", str(src),
               "-af", f"silencedetect=noise={noise_db}dB:duration={min_gap}",
-              "-f", "null", "-"], check=False, capture_output=True, text=True)
+              "-f", "null", "-"], check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
     sil, cur = [], None
     for line in r.stderr.splitlines():
         m = re.search(r"silence_start: ([\d.]+)", line)
@@ -77,11 +166,134 @@ def detect_silences(src: Path, noise_db: float, min_gap: float):
     return sil
 
 
-def transcribe(src: Path, wd: Path):
+def remap_words_through_keeps(words, keeps):
+    """After splicing a video by concatenating `keeps` segments (in original
+    source-video time) into one continuous output, a word's absolute
+    timestamp in the ORIGINAL source needs to be re-expressed as a
+    timestamp in the NEW (post-cut) output — segments before it in time got
+    physically removed, shifting everything after them earlier. A word
+    that fell inside a segment that got cut no longer exists in the output
+    at all and is dropped. Words that straddle a kept/cut boundary are also
+    dropped (rare — cut boundaries land in silence, not mid-word) rather
+    than emitted with a corrupted duration.
+
+    This is what lets a transcript correction made during Clean (before
+    cutting) survive into the post-cut transcript used for captions/editing
+    — instead of the downstream stage re-transcribing the cut video from
+    scratch and losing the correction, we just carry the already-correct
+    text through the same time transform the video itself went through."""
+    out = []
+    offset = 0.0
+    for (a, b) in keeps:
+        for w in words:
+            if w["start"] >= a and w["end"] <= b:
+                out.append({**w, "start": round(w["start"] - a + offset, 3),
+                            "end": round(w["end"] - a + offset, 3)})
+        offset += (b - a)
+    out.sort(key=lambda w: w["start"])
+    return out
+
+
+def find_silences_from_transcript(words, total_duration: float, min_gap: float):
+    """Derive silence gaps directly from word-level ASR timestamps instead
+    of raw audio amplitude thresholding (detect_silences/silencedetect).
+    Amplitude thresholding asks "is the audio quiet?" — a question that
+    depends entirely on the recording's background noise level, and breaks
+    down whenever ambient noise sits above whatever threshold was picked
+    (the exact failure mode this project kept hitting). This asks "is the
+    SPEAKER talking?" instead — WhisperX's forced-alignment already
+    determined precise word start/end times from the actual speech content,
+    so any span with no word in it is silence with respect to the speaker,
+    independent of how loud the room is. No noise floor involved at all.
+    Returns gaps at least `min_gap` seconds long, as (start, end) tuples."""
+    if not words: return []
+    gaps = []
+    prev_end = 0.0
+    for w in words:
+        if w["start"] - prev_end >= min_gap:
+            gaps.append((prev_end, w["start"]))
+        prev_end = max(prev_end, w["end"])
+    if total_duration - prev_end >= min_gap:
+        gaps.append((prev_end, total_duration))
+    return gaps
+
+
+def auto_min_gap_from_words(words) -> float:
+    """Determine what counts as a 'cuttable' pause from THIS speaker's own
+    natural cadence, instead of one fixed duration applied to everyone.
+    Different people speak with different natural pause lengths between
+    phrases — a fixed threshold either cuts into someone's normal rhythm
+    (too short) or misses most of a fast talker's real pauses (too long,
+    the exact problem hit earlier today: 0.3s fixed vs. this speaker's
+    actual ~0.1s pauses).
+
+    Computes the gap before every word in the transcript, takes the
+    median as "this speaker's typical short pause," and sets the cut
+    threshold at 1.5x that — long enough that normal speaking rhythm
+    survives untouched, short enough to catch pauses distinctly longer
+    than the speaker's own baseline. Purely derived from this video's own
+    transcript; no fixed absolute duration is assumed up front."""
+    if len(words) < 3: return 0.12
+    gaps = [words[i]["start"] - words[i - 1]["end"] for i in range(1, len(words))]
+    gaps = [g for g in gaps if g > 0]
+    if not gaps: return 0.12
+    gaps.sort()
+    median = gaps[len(gaps) // 2]
+    return max(0.08, median * 1.5)
+
+
+def auto_noise_db(src: Path, min_gap: float, total_duration: float) -> float:
+    """Calibrate the silencedetect threshold to THIS recording's actual
+    background noise floor, instead of using one fixed default for every
+    upload. A fixed -32dB works for quiet studio audio, but on a noisier
+    recording (room tone, fan, ambient hum) the audio never drops that low
+    even during real pauses — silencedetect then finds ZERO gaps and the
+    "clean" step silently does nothing about silence, which reads as
+    completely broken from the outside even though nothing crashed.
+
+    Sweeps thresholds from strictest (quietest-required) to loosest, and
+    picks the STRICTEST one that still finds a plausible amount of silence
+    for spoken content (roughly 3-40% of total duration) — stricter is
+    safer (less likely to misclassify real speech as a gap), so we only
+    loosen the threshold as far as this recording's noise floor forces us
+    to. Falls back to the old -32dB default if nothing in the sweep looks
+    reasonable (e.g. a near-silent or already-tightly-cut source)."""
+    for db in (-40, -36, -32, -30, -28, -26, -24, -22, -20, -18):
+        sil = detect_silences(src, db, min_gap)
+        covered = sum(e - s for s, e in sil)
+        frac = covered / max(total_duration, 1.0)
+        if 0.03 <= frac <= 0.40:
+            return float(db)
+    return -32.0
+
+
+def transcribe(src: Path, wd: Path, sess=None):
     out = wd / "words.json"
     if out.exists() and out.stat().st_mtime >= src.stat().st_mtime:
         return json.loads(out.read_text(encoding="utf-8"))
-    _run([str(VENV_PY), str(TRANSCRIBE), str(src)], check=True)
+    cmd = [str(VENV_PY), str(TRANSCRIBE), str(src)]
+    if sess is None:
+        _run(cmd, check=True)
+    else:
+        # WhisperX prints no percentage, just phase markers ("[1/2] Extracting
+        # audio", "[2/2] Transcribing with WhisperX") -- but on a longform
+        # multi-minute video this step alone can run minutes with the OLD
+        # blocking _run() call giving zero signal to the UI meanwhile, same
+        # looks-frozen bug as stabilize/camera_movement/splice. No frame-count
+        # progress is available here, so surface the coarse phase text instead
+        # of nothing.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, encoding="utf-8", errors="replace", bufsize=1)
+        tail = []
+        for line in proc.stdout:
+            line = line.rstrip()
+            tail.append(line)
+            if len(tail) > 200: tail.pop(0)
+            if line:
+                sess["transcribe_phase"] = line
+        proc.wait()
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd, output="\n".join(tail))
     skill_wd = Path.home() / ".cache" / "video-edit"
     digest = hashlib.sha1(str(src.resolve()).encode()).hexdigest()[:12]
     sw = skill_wd / f"{src.stem[:40]}_{digest}" / "words.json"
@@ -90,43 +302,262 @@ def transcribe(src: Path, wd: Path):
     return json.loads(out.read_text(encoding="utf-8"))
 
 
+def pad_span_safe(words, start_idx: int, end_idx: int, pad: float):
+    """Pad a cut span [words[start_idx].start, words[end_idx].end] by `pad`
+    seconds on each side, but never past the MIDPOINT of the gap to an
+    adjacent word. A blind fixed pad bites into a KEPT neighboring word's
+    actual spoken audio whenever the natural gap between words is smaller
+    than the pad — routine in fast speech (gaps of 0.02-0.05s are common),
+    and the exact mechanism behind a kept word surviving a cut half-
+    truncated (e.g. "the process is simple" rendering as "the p...")."""
+    start = words[start_idx]["start"]
+    if start_idx > 0:
+        gap = max(0.0, words[start_idx]["start"] - words[start_idx - 1]["end"])
+        start -= min(pad, gap / 2)
+    else:
+        start -= pad
+    end = words[end_idx]["end"]
+    if end_idx + 1 < len(words):
+        gap = max(0.0, words[end_idx + 1]["start"] - words[end_idx]["end"])
+        end += min(pad, gap / 2)
+    else:
+        end += pad
+    return (start, end)
+
+
+def find_repeated_phrases(words):
+    """Detect repeated word n-grams anywhere in the word stream — not just
+    back-to-back repeats — catching failure modes the pause-based sentence
+    chunker in find_retakes() can't see:
+      1. Same-breath retakes: speaker messes up and immediately redoes the
+         line with near-zero pause (<0.4s), so the pause-chunker never
+         splits them into separate "sentences" to compare in the first
+         place.
+      2. Rambled/jumbled retakes: speaker retries a line 3-4 times with NO
+         pause anywhere and DIFFERENT filler/partial content interleaved
+         between attempts (e.g. "Work is very simple. You just have to put
+         raw video and edit it. Work is very simple. Work is very simple.
+         You just have to put raw video.") — the repeated phrase isn't
+         adjacent to itself, so a simple consecutive-run scan misses it.
+      3. ASR hallucination loops: Whisper getting stuck repeating the same
+         short phrase 10-30+ times back-to-back on silence/unclear audio —
+         a known failure mode, not a real retake. These get cut ENTIRELY
+         (not "keep the last one") since none of the repeats are real
+         speech.
+    Runs in two stages:
+
+    STAGE A — hallucination loops. A tight, immediately-consecutive run of
+    4+ repeats of a short (<=4 word) phrase with near-zero gaps is ASR
+    noise, not a real retake — cut in full, all occurrences. This MUST run
+    before Stage B: a long loop of e.g. 56 repeats, if left to Stage B's
+    general "keep last" matcher, gets fragmented into many different
+    "longest common n-gram, keep the last occurrence of THIS n-gram"
+    decisions (since many overlapping n-gram alignments exist inside a
+    periodic repeat), each of which "keeps" a different small span —
+    leaving several stray repeats of pure noise behind instead of removing
+    all of it.
+
+    STAGE B — general non-adjacent duplicate-phrase dedup, for genuine
+    retakes: scans n-gram lengths from longest to shortest, hashes every
+    phrase's occurrence positions, groups occurrences into clusters by time
+    gap, and for each cluster with 2+ occurrences keeps the LAST one
+    (assumed to be the final take) and cuts the rest. Catches same-breath
+    retakes (near-zero pause, so the pause-based sentence chunker in
+    find_retakes() never splits them into separate chunks to compare) and
+    rambled retakes (speaker retries a line 3-4 times with different filler
+    interleaved between attempts, so the repeat isn't even adjacent).
+
+    Stage B runs in multiple passes: a single greedy longest-first pass can
+    make a locally-correct but globally-wrong call — a long phrase match
+    spans occurrence A (early) and occurrence C (late) and "keeps" C, while
+    a shorter phrase match between an intermediate occurrence B and C never
+    fires because C was already claimed as "kept" by the first decision, so
+    B wrongly survives even though C supersedes it too. Re-running the scan
+    lets a still-unclaimed B get re-compared against the previously-kept C,
+    since only CUT spans persist across passes — "kept" claims are local to
+    one pass.
+
+    Returns cut spans as (start, end) tuples."""
+    # Some ASR output emits punctuation as its own standalone word entry
+    # (e.g. a lone "," between two otherwise-adjacent repeats). Left in,
+    # its stripped-to-empty token breaks back-to-back adjacency checks,
+    # since the real content words are no longer exactly index-adjacent
+    # even though the TIME gap between them is near-zero. Dropping
+    # punctuation-only entries up front (they carry no content) fixes this
+    # at the root, and every remaining entry keeps its true timestamp.
+    words = [w for w in words if w["word"].strip(".,!?\"'") != ""]
+    n = len(words)
+    if n < 2: return []
+    toks = [w["word"].lower().strip(".,!?\"'") for w in words]
+
+    HALLUCINATION_MIN_RUN = 4
+    HALLUC_MAX_GLEN = 4
+    HALLUC_GAP_LIMIT = 1.0  # seconds; tight back-to-back only
+
+    claimed = [False] * n
+
+    # ── Stage A ──────────────────────────────────────────────────────────
+    i = 0
+    while i < n:
+        best = None  # (phrase_len, run_count, run_end_idx)
+        for plen in range(1, HALLUC_MAX_GLEN + 1):
+            if i + plen > n: break
+            phrase = toks[i:i + plen]
+            run = 1
+            pos = i + plen
+            while pos + plen <= n:
+                if words[pos]["start"] - words[pos - 1]["end"] > HALLUC_GAP_LIMIT: break
+                if toks[pos:pos + plen] != phrase: break
+                run += 1; pos += plen
+            if run >= 2 and (best is None or (plen, run) > (best[0], best[1])):
+                best = (plen, run, pos)
+        if best and best[1] >= HALLUCINATION_MIN_RUN:
+            _plen, _run, end_idx = best
+            for k in range(i, end_idx): claimed[k] = True
+            i = end_idx
+        else:
+            i += 1
+
+    # ── Stage B ──────────────────────────────────────────────────────────
+    MIN_NGRAM, MAX_NGRAM = 3, min(12, n)
+    MAX_GAP_SEC = 20.0  # occurrences farther apart than this aren't the same retake attempt
+    MAX_PASSES = 3
+
+    cut_word_idx: set[int] = {k for k in range(n) if claimed[k]}
+
+    for _pass in range(MAX_PASSES):
+        pass_claimed = [i in cut_word_idx for i in range(n)]
+        pass_cuts: list[tuple[int, int]] = []  # (start_idx, glen)
+
+        for glen in range(MAX_NGRAM, MIN_NGRAM - 1, -1):
+            seen: dict[tuple, list[int]] = {}
+            for i in range(0, n - glen + 1):
+                if any(pass_claimed[i:i + glen]): continue
+                phrase = tuple(toks[i:i + glen])
+                seen.setdefault(phrase, []).append(i)
+            for phrase, idxs in seen.items():
+                if len(idxs) < 2: continue
+                idxs.sort()
+                clusters = [[idxs[0]]]
+                for idx in idxs[1:]:
+                    if any(pass_claimed[idx:idx + glen]): continue
+                    prev_end = clusters[-1][-1] + glen - 1
+                    gap = words[idx]["start"] - words[prev_end]["end"]
+                    if gap <= MAX_GAP_SEC:
+                        clusters[-1].append(idx)
+                    else:
+                        clusters.append([idx])
+                for cluster in clusters:
+                    if len(cluster) < 2: continue
+                    for idx in cluster[:-1]:
+                        if any(pass_claimed[idx:idx + glen]): continue
+                        pass_cuts.append((idx, glen))
+                        for k in range(idx, idx + glen): pass_claimed[k] = True
+                    last_idx = cluster[-1]
+                    for k in range(last_idx, last_idx + glen): pass_claimed[k] = True
+
+        if not pass_cuts:
+            break
+        for idx, glen in pass_cuts:
+            cut_word_idx.update(range(idx, idx + glen))
+
+    if not cut_word_idx: return []
+    cuts = []
+    idxs_sorted = sorted(cut_word_idx)
+    run_start = prev = idxs_sorted[0]
+    for idx in idxs_sorted[1:]:
+        if idx == prev + 1:
+            prev = idx; continue
+        cuts.append(pad_span_safe(words, run_start, prev, 0.05))
+        run_start = prev = idx
+    cuts.append(pad_span_safe(words, run_start, prev, 0.05))
+    return cuts
+
+
 def find_retakes(words):
     if not words: return []
     from difflib import SequenceMatcher
-    cuts = []
-    # stutter
+    cuts = list(find_repeated_phrases(words))
+    # stutter — immediate word-level repeat ("the the")
     for i in range(len(words) - 1):
         a = words[i]["word"].lower().strip(".,!?\"'")
         b = words[i+1]["word"].lower().strip(".,!?\"'")
         if a == b and (words[i+1]["start"] - words[i]["end"]) < 0.8 and len(a) >= 2:
-            cuts.append((words[i]["start"] - 0.04, words[i]["end"] + 0.04))
-    # sentence retakes
+            cuts.append(pad_span_safe(words, i, i, 0.04))
+
+    # Sentence retakes. Word-level ASR output carries no punctuation, so
+    # "sentences" here are pause-delimited phrase chunks — a proxy, not a
+    # real sentence boundary. A mid-thought breath pause fragments one
+    # spoken sentence into several of these chunks, which is why matching
+    # needs to look across a TIME window rather than a fixed chunk count:
+    # the old version only looked 3 chunks ahead, so a retake cluster with
+    # more than ~3 pause-fragments between attempts (very easy to hit with
+    # 4-5 re-recordings of the same line) went undetected. It also stopped
+    # after the first pairwise match, so long retake chains (3+ attempts)
+    # only got partially cut.
     sentences, cur = [], []
     for w in words:
         if cur and (w["start"] - cur[-1]["end"]) > 0.4:
             sentences.append(cur); cur = []
         cur.append(w)
     if cur: sentences.append(cur)
+
+    def tokens_of(sent):
+        return [w["word"].lower().strip(".,!?\"'") for w in sent]
+
+    n = len(sentences)
     used = set()
-    for i in range(len(sentences) - 1):
+    clusters: list[list[int]] = []
+    RETAKE_WINDOW_SEC = 12.0  # how far ahead a re-attempt can land, wall-clock
+    MIN_TOKENS = 3
+    MATCH_RATIO = 0.55  # required on BOTH sides, not just the earlier sentence —
+
+    for i in range(n):
         if i in used: continue
-        sa = sentences[i]
-        a_tokens = [w["word"].lower().strip(".,!?\"'") for w in sa]
-        if len(a_tokens) < 2: continue
-        for j in range(i+1, min(i+4, len(sentences))):
-            sb = sentences[j]
-            if sb[0]["start"] - sa[-1]["end"] > 4.0: break
-            b_tokens = [w["word"].lower().strip(".,!?\"'") for w in sb]
-            if len(b_tokens) < 2: continue
-            sm = SequenceMatcher(None, a_tokens, b_tokens, autojunk=False)
-            lo = sm.find_longest_match(0, len(a_tokens), 0, len(b_tokens))
-            ratio_a = lo.size / len(a_tokens)
-            is_prefix = lo.a == 0 and lo.b == 0 and lo.size >= 3
-            is_overlap = lo.size >= 3 and ratio_a >= 0.5
-            if is_prefix or is_overlap:
-                ms = sa[lo.a]; me = sa[lo.a + lo.size - 1]
-                cuts.append((ms["start"] - 0.05, me["end"] + 0.05))
-                used.add(i); break
+        a_tokens = tokens_of(sentences[i])
+        if len(a_tokens) < MIN_TOKENS: continue
+        cluster = [i]
+        anchor_tokens = a_tokens
+        anchor_end_time = sentences[i][-1]["end"]
+        j = i + 1
+        while j < n:
+            if sentences[j][0]["start"] - anchor_end_time > RETAKE_WINDOW_SEC:
+                break
+            if j in used:
+                j += 1; continue
+            b_tokens = tokens_of(sentences[j])
+            matched = False
+            if len(b_tokens) >= MIN_TOKENS:
+                sm = SequenceMatcher(None, anchor_tokens, b_tokens, autojunk=False)
+                lo = sm.find_longest_match(0, len(anchor_tokens), 0, len(b_tokens))
+                ratio_a = lo.size / len(anchor_tokens)
+                ratio_b = lo.size / len(b_tokens)
+                # requiring the match on BOTH sides (not just ratio_a, as
+                # before) stops a short new sentence that merely shares a
+                # few words with a much longer earlier one from falsely
+                # tripping the retake detector and cutting real content.
+                matched = lo.size >= MIN_TOKENS and ratio_a >= MATCH_RATIO and ratio_b >= MATCH_RATIO
+            if matched:
+                cluster.append(j)
+                # re-anchor on the newest match so wording drift across a
+                # long chain of retakes doesn't lose the thread
+                anchor_tokens = b_tokens
+                anchor_end_time = sentences[j][-1]["end"]
+            j += 1
+        if len(cluster) > 1:
+            clusters.append(cluster)
+            used.update(cluster)
+
+    # Cut every sentence in a cluster EXCEPT the last — the final take is
+    # kept, everything before it in that retake cluster is removed.
+    word_idx_by_id = {id(w): i for i, w in enumerate(words)}
+    for cluster in clusters:
+        for idx in cluster[:-1]:
+            s = sentences[idx]
+            start_idx = word_idx_by_id[id(s[0])]
+            end_idx = word_idx_by_id[id(s[-1])]
+            cuts.append(pad_span_safe(words, start_idx, end_idx, 0.05))
+
     if not cuts: return []
     cuts.sort()
     merged = [list(cuts[0])]
@@ -136,7 +567,8 @@ def find_retakes(words):
     return [tuple(m) for m in merged]
 
 
-def build_keeps(total, silences, retake_cuts, target_gap, cut_head, cut_tail):
+def build_keeps(total, silences, retake_cuts, target_gap, cut_head, cut_tail,
+                 head_buffer_sec: float = 0.0, tail_buffer_sec: float = 0.0):
     expanded = [[s, e] for s, e in silences]
     for rs, re_ in retake_cuts:
         merged = False
@@ -156,9 +588,16 @@ def build_keeps(total, silences, retake_cuts, target_gap, cut_head, cut_tail):
         is_tail = i == n - 1 and se >= total - 0.1 and cut_tail
         contains_retake = any(ss - 0.1 <= rs and re_ <= se + 0.1 for rs, re_ in retake_cuts)
         if is_head:
-            prev = se; continue
+            # Trim the head silence but leave head_buffer_sec of it right
+            # before speech starts, instead of cutting flush to the first
+            # word — a hard flush cut reads as an abrupt, jarring cold
+            # start with zero breathing room.
+            prev = max(ss, se - head_buffer_sec); continue
         if is_tail:
-            if ss > prev: keeps.append((prev, ss))
+            # Same idea at the tail: keep tail_buffer_sec of pause after
+            # the last word instead of cutting off the instant speech ends.
+            tail_keep_end = min(se, ss + tail_buffer_sec)
+            if tail_keep_end > prev: keeps.append((prev, tail_keep_end))
             prev = se; break
         if contains_retake:
             if ss > prev: keeps.append((prev, ss))
@@ -170,40 +609,116 @@ def build_keeps(total, silences, retake_cuts, target_gap, cut_head, cut_tail):
     return keeps
 
 
-def build_audio_chain(denoise_i: float, enhance_i: float) -> str:
+def build_audio_chain(denoise_i: float, enhance_i: float, noise_floor_db: float | None = None,
+                       volume_pct: float = 100.0) -> str:
     """Compose ffmpeg audio filter chain. Each intensity 0-1.
-    denoise: RNNoise + spectral afftdn. enhance: EQ + compress + loudness norm."""
+    denoise: RNNoise + spectral afftdn. enhance: EQ + compress + loudness norm.
+
+    afftdn's `nf` parameter tells it "signal at or below this dB level is
+    noise, suppress it." The old fixed -20 to -35dB range was blind to the
+    actual recording — on audio whose real background noise sits LOUDER
+    than -35dB (very common: room tone, fan, traffic), nf ends up STRICTER
+    (quieter) than the real noise floor, so afftdn never recognizes the
+    actual noise as noise at all and silently does nothing. Anchoring nf to
+    the recording's measured noise floor (noise_floor_db — the same
+    calibrated silencedetect threshold used for silence-cutting, see
+    auto_noise_db()) instead of a blind fixed range fixes this the same way
+    silence detection was fixed: measure, don't assume."""
     filters = []
     if denoise_i > 0.02:
-        nf = -20 - int(15 * denoise_i)  # -20 to -35
-        filters.append(f"afftdn=nf={nf}:nt=w")
+        if noise_floor_db is not None:
+            # Sit right at the measured floor at low intensity (gentle —
+            # only strip what's clearly noise), ranging further above it
+            # (more aggressive, catches more of the signal as noise) as
+            # intensity increases. Capped so high intensity on a very loud
+            # noise floor can't start eating real speech.
+            nf = min(noise_floor_db + 1 + 7 * denoise_i, -8)
+        else:
+            nf = -20 - 15 * denoise_i  # -20 to -35, old fixed fallback
+        filters.append(f"afftdn=nf={int(round(nf))}:nt=w")
     if enhance_i > 0.02:
-        cut_db = int(-3 - 6 * enhance_i)  # -3 to -9
-        boost_db = round(2 + 3 * enhance_i, 1)  # +2 to +5
-        ratio = round(2 + 2 * enhance_i, 1)  # 2 to 4
-        filters.append(f"equalizer=f=80:t=h:g={cut_db}")
+        # Low-end rumble cut. Previously used `equalizer=f=80:t=h:g=...` —
+        # but ffmpeg's `equalizer` filter is a narrow peaking/notch filter
+        # whose `width` defaults to 1 (in whatever unit `t` sets) when not
+        # given explicitly. That line never set `w=`, so it was cutting a
+        # ~1Hz-wide sliver at 80Hz — inaudible, effectively a no-op the
+        # whole time. `highpass` is the correct tool for broadband rumble/
+        # room-tone removal below a cutoff, not a peaking EQ. Cutoff rises
+        # with intensity so more aggressive settings remove more low end.
+        # Ceiling was way too aggressive at intensity=1 — ratio=4:1
+        # compression + a 5dB presence boost + dynaudnorm all stacked at
+        # max is heavy enough to produce audible "pumping" (loudness
+        # visibly riding up and down as the compressor/normalizer react),
+        # which is very plausibly what gets described as "pitch not
+        # constant" by ear even though it's a dynamics artifact, not an
+        # actual frequency-domain pitch shift. "Enhance" should read as
+        # polish at any intensity, not as obvious processing. Gentler
+        # ceiling across the board; dynaudnorm's own aggressiveness now
+        # scales with intensity too instead of being fixed regardless of
+        # the slider position.
+        hp_freq = int(50 + 40 * enhance_i)  # 50Hz to 90Hz cutoff
+        boost_db = round(1.5 + 2.0 * enhance_i, 1)  # +1.5 to +3.5
+        ratio = round(1.5 + 1.0 * enhance_i, 1)  # 1.5 to 2.5
+        dyn_p = round(0.5 + 0.35 * enhance_i, 2)  # 0.5 to 0.85 (dynaudnorm max gain change)
+        filters.append(f"highpass=f={hp_freq}")
         filters.append(f"equalizer=f=4000:t=q:w=2:g={boost_db}")
         filters.append(f"acompressor=threshold=-18dB:ratio={ratio}:attack=5:release=80")
-        filters.append("dynaudnorm=p=0.95:m=10:s=12")
+        filters.append(f"dynaudnorm=p={dyn_p}:m=10:s=12")
+    if abs(volume_pct - 100.0) > 0.5:
+        filters.append(f"volume={volume_pct / 100.0:.3f}")
     return ",".join(filters) if filters else "anull"
 
 
-def splice(src, keeps, out, audio_filter: str = "anull"):
+def splice_trim_concat(src, keeps, raw_out: Path, sess=None):
+    """The expensive part of the old splice() — trim+concat, video
+    re-encoded, audio carried through UNFILTERED — now its own step (was
+    splice()'s internal pass 1) so job_clean_finish() can run
+    stabilize/camera_movement on THIS output before the audio filter runs,
+    instead of on the raw pre-cut upload (see apply_stabilize_and_camera_movement
+    for why that reorder matters). Writes directly to raw_out; the caller
+    decides what that path means downstream.
+
+    A hard atrim cut lands wherever the cut math says to, almost never
+    exactly on a waveform zero-crossing — so concatenating raw trimmed
+    segments leaves an abrupt amplitude discontinuity at every single cut
+    point, heard as a click/pop. With dozens of cuts (silences + retakes)
+    across a video that adds up to constant audible "glitching." A very
+    short (8ms, inaudible as an actual fade) in/out fade on each segment
+    eliminates the discontinuity at zero perceptible cost to speech.
+    """
+    FADE = 0.008
     parts, labels = [], []
     for i, (a, b) in enumerate(keeps):
+        dur = b - a
+        fade = min(FADE, dur / 4)
         parts.append(f"[0:v]trim=start={a}:end={b},setpts=PTS-STARTPTS[v{i}]")
-        parts.append(f"[0:a]atrim=start={a}:end={b},asetpts=PTS-STARTPTS[a{i}]")
+        parts.append(
+            f"[0:a]atrim=start={a}:end={b},asetpts=PTS-STARTPTS,"
+            f"afade=t=in:st=0:d={fade},afade=t=out:st={max(0.0, dur - fade)}:d={fade}[a{i}]"
+        )
         labels.append(f"[v{i}][a{i}]")
-    parts.append(f"{''.join(labels)}concat=n={len(keeps)}:v=1:a=1[outv][outaraw]")
-    if audio_filter and audio_filter != "anull":
-        parts.append(f"[outaraw]{audio_filter}[outa]")
-        out_a_map = "[outa]"
-    else:
-        out_a_map = "[outaraw]"
-    _run(["ffmpeg", "-y", "-i", str(src), "-filter_complex", ";".join(parts),
-          "-map", "[outv]", "-map", out_a_map,
+    parts.append(f"{''.join(labels)}concat=n={len(keeps)}:v=1:a=1[outv][outa]")
+    # Total is the KEPT-timeline duration (the concat output), not the
+    # source's, since that's what ffmpeg's own progress `time=` counts up
+    # towards here.
+    total_sec = sum(b - a for a, b in keeps)
+    run_ffmpeg_progress(["ffmpeg", "-y", "-i", str(src), "-filter_complex", ";".join(parts),
+          "-map", "[outv]", "-map", "[outa]",
           "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-          "-c:a", "aac", "-b:a", "192k", str(out)], check=True)
+          "-c:a", "aac", "-b:a", "192k", str(raw_out)], str(raw_out.parent), total_sec, sess, "Cutting & splicing video")
+
+
+def apply_audio_filter(raw: Path, out: Path, audio_filter: str = "anull"):
+    """Pass 2 of splice() — cheap: video stream copied untouched, only
+    audio gets (re-)encoded through the filter chain. Safe to call
+    repeatedly against the same `raw` intermediate with a different
+    filter each time (e.g. the user adjusting a denoise slider) without
+    ever compounding a previous filter pass."""
+    args = ["ffmpeg", "-y", "-i", str(raw)]
+    if audio_filter and audio_filter != "anull":
+        args += ["-filter:a", audio_filter]
+    args += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", str(out)]
+    _run(args, check=True)
 
 
 def extract_waveform(src: Path, samples: int = 400) -> list[float]:
@@ -229,16 +744,30 @@ def extract_waveform(src: Path, samples: int = 400) -> list[float]:
     return peaks[:samples]
 
 
-def detect_clicks(src: Path) -> list[tuple[float, float]]:
+def detect_clicks(src: Path, words: list[dict] | None = None) -> list[tuple[float, float]]:
     """Detect short pops/clicks: very short loud transients (silencedetect inverse).
     Heuristic: silences at very tight threshold pick out non-silence segments,
-    short ones (< 0.15s) flanked by silence on both sides = likely click."""
+    short ones (< 0.15s) flanked by silence on both sides = likely click.
+
+    This is amplitude-only and has no idea what speech is — a real short
+    word ("a", "is", "it" are routinely under 0.15s) matches the exact
+    same shape as a click and would otherwise get cut as if it were noise.
+    Cross-checking against the transcript (words, when available) so any
+    candidate that actually overlaps real spoken word timing is skipped —
+    this is very likely the cause of "clicks removal conflicts with
+    retakes": a short word near a retake boundary getting double-flagged
+    and cut by both systems independently."""
     sil = detect_silences(src, -20, 0.05)
     clicks = []
     for i in range(len(sil) - 1):
         gap_start = sil[i][1]
         gap_end = sil[i+1][0]
         if 0 < gap_end - gap_start < 0.15:
+            overlaps_word = words and any(
+                w["start"] < gap_end and w["end"] > gap_start for w in words
+            )
+            if overlaps_word:
+                continue
             clicks.append((gap_start - 0.02, gap_end + 0.02))
     return clicks
 
@@ -331,26 +860,15 @@ def generate_plan(words):
     return plan
 
 
-def copy_to_render_wd(src, edit_wd):
-    """render.sh on Windows hashes the path differently. Copy plan to likely render workdirs."""
-    bp = "/" + str(src).replace("\\", "/").replace(":", "")
-    if bp[1].isalpha(): bp = "/" + bp[1].lower() + bp[2:]
-    digests = [
-        hashlib.sha1(str(src.resolve()).encode()).hexdigest()[:12],
-        hashlib.sha1(bp.encode()).hexdigest()[:12],
-        hashlib.sha1(str(src).replace("\\", "/").encode()).hexdigest()[:12],
-    ]
-    for d in set(digests):
-        tgt = WORK_ROOT / f"{src.stem[:40]}_{d}"
-        if tgt == edit_wd: continue
-        tgt.mkdir(parents=True, exist_ok=True)
-        for f in ("broll_plan.json", "words.json"):
-            if (edit_wd / f).exists(): shutil.copy(edit_wd / f, tgt / f)
-        if (edit_wd / "broll").exists():
-            tb = tgt / "broll"; tb.mkdir(exist_ok=True)
-            for f in (edit_wd / "broll").iterdir(): shutil.copy(f, tb)
-        (tgt / ".polished").touch()
-        (tgt / "broll_plan.source.json").unlink(missing_ok=True)
+# NOTE: render.sh's workdir used to be guessed (Windows bash vs Python hash
+# the same path differently), so this module used to shotgun-copy the plan
+# into every guessed variant "just in case". That's gone now — every render
+# call passes STUDIO_WORKDIR explicitly (see BASH invocations below), so
+# render.sh always looks in the exact right place. The old guess-and-copy
+# function was deleted: variant #1 of its guesses was literally the same
+# formula as workdir_for(), so it would silently overwrite a DIFFERENT
+# session's plan any time two sessions shared a source video — real data
+# loss, not just wasted work.
 
 
 def append_chat(sid, role, text, typ="msg"):
@@ -363,7 +881,7 @@ def queue_path(sid: str) -> Path | None:
     reads this file to apply natural-language fixes the UI can't do itself."""
     sess = SESSIONS.get(sid)
     if not sess: return None
-    wd = Path(sess.get("edit_workdir") or sess.get("workdir") or "")
+    wd = edit_workdir_for(sess)
     return wd / "prompt_queue.json" if wd else None
 
 
@@ -381,54 +899,433 @@ def enqueue_prompt(sid: str, text: str) -> Path | None:
 
 
 # ───────────── Jobs ─────────────
-def job_clean(sid):
+def apply_camera_movement(src: Path, out: Path, mode: str, intensity: float = 0.5, sess=None):
+    """CapCut's "AI Movement Tracking" — NOT subject-tracking, NOT
+    stabilization (confirmed directly from CapCut's own tool page): it
+    adds SYNTHETIC camera motion (zoom/shake/soft/dynamic) to footage that
+    doesn't have real camera movement, to make a locked-off shot feel more
+    alive. Implemented as a crop-then-scale-back-up trick: crop a window
+    smaller than the source frame with a time-varying position/size, then
+    scale that window back up to the original resolution — the crop
+    window's movement over time IS the "camera movement." All four modes
+    are real ffmpeg video filters, no external model.
+
+    zoom  — crop window steadily shrinks (i.e. picture appears to zoom in)
+    shake — crop window's position jitters on independent sine waves per
+            axis (different frequency/phase so it doesn't look like a
+            simple circle) — simulated handheld camera
+    soft  — same idea as zoom but much gentler amplitude and slower, for
+            a barely-there ambient drift
+    dynamic — NOT implemented here; see follow_subject_camera() below,
+            which drives the crop window from actual tracked face
+            position instead of a synthetic sine/linear function
+
+    IMPORTANT: crop's w/h here are TIME-VARYING (zoom mode shrinks the
+    crop window over the clip), which means the cropped frame size
+    itself changes frame to frame — but a video stream must have a
+    CONSTANT frame size to encode at all. The fix is scaling back up to
+    the literal original resolution (probed once, hardcoded numbers),
+    NOT `scale=iw:ih` — `iw`/`ih` after a crop refer to the crop's own
+    (still-varying) output size, so that would just carry the same
+    varying-size problem one step further instead of fixing it. Confirmed
+    directly: this was the actual cause of zoom's ffmpeg failure, not an
+    eval-mode issue (crop in this ffmpeg build has no `eval` option at
+    all — an earlier, wrong theory)."""
+    probe = _run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                  "-show_entries", "stream=width,height", "-of", "csv=p=0", str(src)],
+                 capture_output=True, text=True, check=True)
+    orig_w, orig_h = (int(x) for x in probe.stdout.strip().split(",")[:2])
+
+    if mode == "zoom":
+        # crop genuinely cannot animate w/h at all (confirmed directly —
+        # ffmpeg errors "Error reinitializing filters" the instant crop's
+        # own output size would change frame to frame, since a video
+        # stream must have constant dimensions). scale CAN grow per-frame
+        # (it has an eval=frame option crop doesn't), so the zoom effect
+        # is: scale the image progressively larger, then crop a FIXED
+        # orig_w x orig_h window from the center of that now-larger frame
+        # — crop's own w/h here are plain literals, satisfying the
+        # constant-output-size requirement, while the growing scale
+        # upstream is what actually produces the zoom-in.
+        grow = 0.15 * max(0.05, intensity)
+        sw = f"iw*(1+{grow}*t/{{dur}})"
+        sh = f"ih*(1+{grow}*t/{{dur}})"
+        vf = f"scale=w='{sw}':h='{sh}':eval=frame,crop={orig_w}:{orig_h}"
+    elif mode == "shake":
+        margin = 0.06 * max(0.05, intensity)  # how much crop margin the shake can use
+        cw = f"iw*(1-{margin*2})"
+        ch = f"ih*(1-{margin*2})"
+        cx = f"(iw-out_w)/2 + iw*{margin}*sin(2*PI*1.3*t)"
+        cy = f"(ih-out_h)/2 + ih*{margin}*sin(2*PI*1.7*t+1)"
+        vf = f"crop=w='{cw}':h='{ch}':x='{cx}':y='{cy}',scale={orig_w}:{orig_h}"
+    elif mode == "soft":
+        margin = 0.025 * max(0.05, intensity)
+        cw = f"iw*(1-{margin*2})"
+        ch = f"ih*(1-{margin*2})"
+        cx = f"(iw-out_w)/2 + iw*{margin}*sin(2*PI*0.12*t)"
+        cy = f"(ih-out_h)/2 + ih*{margin*0.6}*sin(2*PI*0.09*t+0.7)"
+        vf = f"crop=w='{cw}':h='{ch}':x='{cx}':y='{cy}',scale={orig_w}:{orig_h}"
+    else:
+        raise ValueError(f"unknown camera movement mode: {mode!r}")
+
+    total_sec = probe_duration(src)
+    if mode == "zoom":
+        vf = vf.format(dur=max(0.1, total_sec))
+    # Per-frame scale/crop expressions on 4K source make this MUCH slower
+    # than a plain encode (observed ~0.18x realtime) with zero feedback
+    # otherwise — same frozen-looking "nothing happening" symptom stabilize
+    # had before run_ffmpeg_progress existed; reusing it here too.
+    run_ffmpeg_progress(["ffmpeg", "-y", "-i", str(src), "-vf", vf,
+          "-c:a", "copy", "-c:v", "libx264", "-preset", "fast", "-crf", "20", str(out)],
+          str(out.parent), total_sec, sess, f"Applying camera movement ({mode})")
+
+
+FFMPEG_TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+
+
+def run_ffmpeg_progress(cmd, cwd, total_sec, sess=None, phase="processing"):
+    """Stream an ffmpeg subprocess's stderr and parse its own
+    `time=HH:MM:SS.ms` line into sess["render_progress"] as it goes —
+    reuses the exact {phase,current,total,eta_sec} shape
+    run_render_streaming() already fills in for Remotion renders, so the
+    frontend's existing progressBarHtml() shows it with no separate UI
+    needed. Two-pass ffmpeg stabilization (vidstabdetect + vidstabtransform)
+    on a full-length video takes real time with subprocess.run's default
+    buffered output giving zero feedback until the whole pass finishes —
+    this is why "stabilizing" looked frozen. sess=None just runs ffmpeg
+    silently (equivalent to the old _run(cmd, check=True))."""
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE, text=True,
+                             encoding="utf-8", errors="replace", bufsize=1)
+    start = time.time()
+    tail = []
+    for line in proc.stderr:
+        tail.append(line)
+        if len(tail) > 200: tail.pop(0)
+        if sess is None: continue
+        m = FFMPEG_TIME_RE.search(line)
+        if m:
+            cur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+            elapsed = time.time() - start
+            rate = cur / elapsed if elapsed > 0 and cur > 0 else 0
+            eta = (total_sec - cur) / rate if rate > 0 else None
+            sess["render_progress"] = {"phase": phase, "current": round(min(cur, total_sec)),
+                                        "total": round(total_sec),
+                                        "eta_sec": round(eta) if eta is not None else None}
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, output="".join(tail))
+
+
+def stabilize_video(src: Path, out: Path, sess=None):
+    """Two-pass ffmpeg stabilization via libvidstab (already compiled into
+    this machine's ffmpeg — verified before building this). Pass 1
+    (vidstabdetect) analyzes camera motion across frames and writes a
+    transform file; pass 2 (vidstabtransform) applies the inverse motion
+    to smooth it out, plus a mild unsharp pass since stabilization softens
+    the image slightly. zoom=0 avoids auto-cropping tighter into the
+    speaker's face than necessary; optzoom=1 lets it pick the minimum zoom
+    that still avoids showing empty/black frame edges.
+
+    vidstabdetect/vidstabtransform's result=/input= options take the
+    transform-file path INSIDE the -vf filtergraph string, where colon
+    and backslash are reserved syntax characters (colon separates filter
+    options, backslash escapes). A raw Windows path breaks the parser at
+    the drive-letter colon — confirmed directly (ffmpeg errors
+    "No option name near..." at exactly that point) and several escaping
+    attempts (backslash-escaping the colon, forward-slashing the path,
+    wrapping in quotes) all still failed the same way. The reliable fix:
+    sidestep colon-in-filtergraph-value parsing entirely by using a
+    relative filename with cwd set to its directory — verified working.
+
+    Both passes stream their own progress into sess["render_progress"]
+    (via run_ffmpeg_progress) when a session dict is passed in — a
+    two-pass full-video ffmpeg run took real wall-clock time with zero
+    visible feedback otherwise, which read as a frozen/hung "stabilizing"
+    status in the UI.
+
+    The severe posterized/"melting" pixel corruption reported against 4K
+    portrait footage (2160x3840) is a resolution-triggered bug in this
+    ffmpeg build's libvidstab, not a tuning problem — confirmed by testing
+    every vidstabtransform parameter individually (shakiness, accuracy,
+    zoom/optzoom, interpol, unsharp amount) against real frames: the exact
+    same corruption appeared regardless of which one changed, but running
+    the identical filter chain on the same footage downscaled to 1080x1920
+    produced a clean frame every time. Fix: run both vidstab passes on a
+    downscaled copy (analysis and transform must match resolution — vidstab
+    stores motion in absolute pixel units, not normalized) and scale back
+    up to the source's original dimensions afterward so output size is
+    unchanged. `'min(1080,iw)':-2` only downscales sources actually above
+    1080 wide and keeps height even (libx264 requirement)."""
+    transforms_name = out.name + ".trf"
+    workdir = str(out.parent)
+    total_sec = probe_duration(src)
+    orig_w, orig_h = probe_dimensions(src)
+    safe_vf = "scale='min(1080,iw)':-2"
+    run_ffmpeg_progress(["ffmpeg", "-y", "-i", str(src), "-vf",
+          f"{safe_vf},vidstabdetect=shakiness=8:accuracy=15:result={transforms_name}",
+          "-f", "null", "-"], workdir, total_sec, sess, "Stabilizing — analyzing motion (pass 1/2)")
+    # unsharp stays mild since downscale-then-upscale softens the image a
+    # touch; crf18/preset slow preserves quality on this once-per-session step
+    # (splice()'s routine cut pass uses crf20/preset fast for speed instead).
+    run_ffmpeg_progress(["ffmpeg", "-y", "-i", str(src), "-vf",
+          f"{safe_vf},vidstabtransform=input={transforms_name}:zoom=0:optzoom=1:smoothing=15:interpol=bicubic,"
+          f"unsharp=3:3:0.5:3:3:0,scale={orig_w}:{orig_h}",
+          "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+          "-c:a", "copy", str(out)], workdir, total_sec, sess, "Stabilizing — smoothing & encoding (pass 2/2)")
+    (out.parent / transforms_name).unlink(missing_ok=True)
+
+
+def apply_combine(sid) -> bool:
+    """Combine multi-source clips into one continuous file — this still has
+    to run before transcription/silence-detection, which need one file to
+    analyze in the first place. Stabilize and camera_movement used to run
+    here too, but now run AFTER splice instead (see
+    apply_stabilize_and_camera_movement) — they're the two expensive
+    per-frame re-encodes in the whole pipeline, and a typical raw recording
+    is mostly silence/retakes that splice() throws away a few steps later;
+    processing that footage before the cut was pure wasted render time (and
+    for camera_movement's zoom specifically, actively wrong-looking — its
+    per-frame growth is a function of time-since-start-of-clip, so applying
+    it before the cut made the final exported zoom jump discontinuously
+    between surviving segments instead of growing smoothly).
+
+    Always rebuilds `j["src"]` forward from `j["orig_src"]` (the true
+    original upload, captured once and never overwritten) rather than
+    mutating `j["src"]` in place. Returns False (and sets an error status)
+    if combine failed; caller should stop immediately in that case.
+    """
     j = SESSIONS[sid]
-    # If multiple sources provided, combine first
-    sources = j.get("sources") or [j["src"]]
+    if "orig_src" not in j:
+        j["orig_src"] = j["src"]
+    cur = Path(j["orig_src"])
+
+    sources = j.get("sources") or [j["orig_src"]]
     if len(sources) > 1:
-        j["status"] = "clean:combining"
-        first = Path(sources[0])
-        combined = first.parent / f"{first.stem}.combined.mp4"
+        already_combined = j.get("combined_path")
+        if already_combined and Path(already_combined).exists():
+            cur = Path(already_combined)
+        else:
+            j["status"] = "clean:combining"
+            j["render_progress"] = None
+            first = Path(sources[0])
+            combined = first.parent / f"{first.stem}.combined.mp4"
+            try:
+                combine_clips(sources, combined, sess=j)
+                cur = combined
+                j["combined_path"] = str(combined)
+            except Exception as e:
+                import traceback
+                j["status"] = "clean:error"; j["error"] = f"combine failed: {e}"
+                j["trace"] = traceback.format_exc()
+                log_error(sid, "combine", str(e))
+                return False
+
+    j["src"] = str(cur)
+    return True
+
+
+def apply_stabilize_and_camera_movement(sid, src: Path) -> Path | None:
+    """Stabilize + camera-movement, run on the SPLICED (already-cut) video
+    rather than the raw upload — see apply_combine's docstring for why this
+    reorder matters. Always runs fresh against whatever `src` it's given
+    (no cross-reclean caching here, unlike combine): the input is a new cut
+    every time job_clean_finish() reaches this point at all, since a pure
+    audio tweak (the common no-video-change reclean) takes the cheaper
+    job_audio_only_finish() path instead and never calls this. Returns the
+    final processed path, or None with j["status"]/error already set on
+    failure."""
+    j = SESSIONS[sid]
+    cur = src
+
+    if j.get("stabilize"):
+        j["status"] = "clean:stabilizing"
+        j["render_progress"] = None
+        stab_out = cur.parent / f"{cur.stem}.stab.mp4"
         try:
-            combine_clips(sources, combined)
-            j["src"] = str(combined)
-            j["combined_path"] = str(combined)
+            stabilize_video(cur, stab_out, sess=j)
         except Exception as e:
             import traceback
-            j["status"] = "clean:error"; j["error"] = f"combine failed: {e}"
+            j["status"] = "clean:error"; j["error"] = f"stabilize failed: {e}"
             j["trace"] = traceback.format_exc()
-            log_error(sid, "combine", str(e))
-            return
+            log_error(sid, "stabilize", str(e))
+            return None
+        cur = stab_out
+
+    camera_mode = j.get("camera_movement", "none")
+    if camera_mode and camera_mode != "none":
+        j["status"] = "clean:camera_movement"
+        # Clear whatever the PREVIOUS stage (e.g. splicing, or stabilize
+        # above) left in render_progress -- otherwise this shows a stale
+        # "100% done" bar the whole time this stage is genuinely still
+        # starting, which reads as more broken than no bar at all.
+        j["render_progress"] = None
+        try:
+            cam_out = cur.parent / f"{cur.stem}.cam.mp4"
+            if camera_mode == "dynamic":
+                # dynamic_camera.py does two slow things with no progress of
+                # their own: (1) a per-frame OpenCV read/crop/write loop at
+                # full source resolution -- much slower than ffmpeg's native
+                # loop -- then (2) an internal ffmpeg remux+scale (scale
+                # added so dynamic's output resolution matches the other
+                # modes) whose own stderr flows through this same captured
+                # stream since dynamic_camera.py doesn't redirect it --
+                # parse BOTH phases' progress lines rather than only the
+                # first, since a fixed "100%" for 2+ minutes during phase 2
+                # is exactly the looks-frozen bug this exists to fix.
+                frame_re = re.compile(r"^frame (\d+)/(\d+)$")
+                total_sec = probe_duration(cur)
+                proc = subprocess.Popen(
+                    [str(VENV_PY), str(SKILL / "scripts/dynamic_camera.py"),
+                     str(cur), str(cam_out), "--zoom", "0.85", "--smoothing", "0.85"],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace", bufsize=1)
+                start = time.time()
+                tail = []
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    tail.append(line)
+                    if len(tail) > 200: tail.pop(0)
+                    elapsed = time.time() - start
+                    m = frame_re.match(line)
+                    if m:
+                        fcur, ftot = int(m.group(1)), int(m.group(2))
+                        rate = fcur / elapsed if elapsed > 0 and fcur > 0 else 0
+                        eta = (ftot - fcur) / rate if rate > 0 else None
+                        j["render_progress"] = {"phase": "Applying camera movement (dynamic) — cropping",
+                                                 "current": fcur, "total": ftot,
+                                                 "eta_sec": round(eta) if eta is not None else None}
+                        continue
+                    m = FFMPEG_TIME_RE.search(line)
+                    if m:
+                        tcur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                        rate = tcur / elapsed if elapsed > 0 and tcur > 0 else 0
+                        eta = (total_sec - tcur) / rate if rate > 0 else None
+                        j["render_progress"] = {"phase": "Applying camera movement (dynamic) — encoding",
+                                                 "current": round(min(tcur, total_sec)), "total": round(total_sec),
+                                                 "eta_sec": round(eta) if eta is not None else None}
+                proc.wait()
+                if proc.returncode != 0:
+                    raise subprocess.CalledProcessError(proc.returncode, "dynamic_camera.py", output="\n".join(tail))
+            else:
+                apply_camera_movement(cur, cam_out, camera_mode,
+                                       intensity=j.get("camera_movement_intensity", 0.5), sess=j)
+        except Exception as e:
+            import traceback
+            j["status"] = "clean:error"; j["error"] = f"camera movement failed: {e}"
+            j["trace"] = traceback.format_exc()
+            log_error(sid, "camera_movement", str(e))
+            return None
+        if cur != src:
+            cur.unlink(missing_ok=True)  # drop the now-consumed stabilize intermediate
+        cur = cam_out
+
+    return cur
+
+
+def job_clean(sid):
+    """Stage 1: transcribe only, then STOP and wait for the user to review/
+    correct the transcript. Splitting this out (rather than transcribing
+    and immediately splicing in one shot) exists because a wrong word in
+    the transcript silently propagates into captions and retake detection
+    — better to catch it before the render happens than to re-render after
+    noticing. See job_clean_finish() for the actual cut/splice stage,
+    triggered by /clean/approve once the user is happy with the transcript."""
+    j = SESSIONS[sid]
+    if not apply_combine(sid):
+        return
     j["status"] = "clean:transcribing"
     src = Path(j["src"])
     wd = workdir_for(src); j["workdir"] = str(wd)
     try:
-        words = transcribe(src, wd)
+        words = transcribe(src, wd, sess=j)
         j["words"] = words  # expose for transcript editor
+        j["status"] = "clean:awaiting_approval"
+    except Exception as e:
+        import traceback
+        j["status"] = "clean:error"; j["error"] = str(e); j["trace"] = traceback.format_exc()
+        log_error(sid, "clean", str(e))
+
+
+def job_clean_finish(sid):
+    """Stage 2: analyze (silence/retake detection, using whatever the user
+    has corrected in the transcript editor by now), splice, THEN
+    stabilize/camera_movement, then the audio filter. Triggered by
+    /clean/approve AND by /clean/reclean — the latter is why apply_combine()
+    runs here too: multi-source combine must already be applied before
+    analyzing, in case this is reached via reclean without a fresh
+    job_clean() first. stabilize/camera_movement live in THIS function
+    (after splice) rather than in preprocessing, specifically so they run on
+    the shorter, already-cut footage instead of the full raw upload — see
+    apply_stabilize_and_camera_movement's docstring."""
+    j = SESSIONS[sid]
+    if not apply_combine(sid):
+        return
+    src = Path(j["src"])
+    words = j.get("words", [])
+    try:
         j["status"] = "clean:analyzing"
-        silences = detect_silences(src, j["noise_db"], j["min_gap"])
+        total = probe_duration(src)
+        # Silence is derived from the TRANSCRIPT (gaps between spoken
+        # words), not raw audio amplitude — see find_silences_from_transcript
+        # for why: amplitude thresholding depends on the recording's
+        # background noise level and breaks down whenever the room isn't
+        # near-silent during pauses. min_gap itself is calibrated to this
+        # speaker's own natural pause length, not a fixed number applied to
+        # everyone. j["min_gap"]/j["noise_db"] are kept for the transcript
+        # editor's waveform view and the denoise audio filter respectively,
+        # not for deciding what counts as a cuttable silence.
+        effective_min_gap = auto_min_gap_from_words(words) if words else j["min_gap"]
+        silences = find_silences_from_transcript(words, total, effective_min_gap)
         retake_cuts = find_retakes(words) if j["remove_retakes"] else []
-        click_cuts = detect_clicks(src) if j.get("remove_clicks") else []
+        click_cuts = detect_clicks(src, words) if j.get("remove_clicks") else []
         manual_cuts = j.get("manual_cuts", [])  # from transcript editor
         extra_cuts = retake_cuts + click_cuts + manual_cuts
         j["status"] = "clean:splicing"
-        total = probe_duration(src)
-        keeps = build_keeps(total, silences, extra_cuts, j["target_gap"], j["cut_head"], j["cut_tail"])
+        j["render_progress"] = None
+        keeps = build_keeps(total, silences, extra_cuts, j["target_gap"], j["cut_head"], j["cut_tail"],
+                             head_buffer_sec=j.get("head_buffer_sec", 0.0),
+                             tail_buffer_sec=j.get("tail_buffer_sec", 0.0))
         # snapshot for undo
         j.setdefault("history", []).append({
             "manual_cuts": list(manual_cuts),
             "noise_db": j["noise_db"], "min_gap": j["min_gap"], "target_gap": j["target_gap"],
             "cut_head": j["cut_head"], "cut_tail": j["cut_tail"],
+            "head_buffer_sec": j.get("head_buffer_sec", 0.5), "tail_buffer_sec": j.get("tail_buffer_sec", 0.5),
             "remove_retakes": j["remove_retakes"], "remove_clicks": j.get("remove_clicks", False),
             "denoise_intensity": j.get("denoise_intensity", 0),
             "enhance_intensity": j.get("enhance_intensity", 0),
         })
         if len(j["history"]) > 20: j["history"] = j["history"][-20:]
 
-        audio_filter = build_audio_chain(j.get("denoise_intensity", 0), j.get("enhance_intensity", 0))
+        audio_filter = build_audio_chain(j.get("denoise_intensity", 0), j.get("enhance_intensity", 0),
+                                          noise_floor_db=j.get("noise_db"), volume_pct=j.get("volume_pct", 100.0))
         out = src.parent / f"{src.stem}.clean.mp4"
-        splice(src, keeps, out, audio_filter=audio_filter)
+        raw = Path(str(out) + ".raw.mp4")
+        # Base cut only, stopping here — stabilize/camera_movement are a
+        # separate, explicit step (POST /clean/apply_camera_effects,
+        # job_apply_camera_effects) the user triggers on THIS result once
+        # they've reviewed it, not bundled into every Clean/Re-clean.
+        splice_trim_concat(src, keeps, raw, sess=j)
+        apply_audio_filter(raw, out, audio_filter)
         j["clean_path"] = str(out)
+
+        # job_edit() re-transcribes on `out` (clean_path) rather than `src`,
+        # which hashes to a DIFFERENT workdir (workdir_for() hashes the
+        # resolved file path). Left alone, that stage would re-transcribe
+        # the cut video from scratch — throwing away any transcript
+        # correction made just now, and reintroducing whatever the raw ASR
+        # got wrong in the first place. Pre-seed that exact workdir with
+        # the already-corrected transcript, remapped through the cut
+        # timeline, so transcribe()'s mtime-cache check finds it fresh and
+        # skips re-transcription entirely.
+        try:
+            remapped = remap_words_through_keeps(words, keeps)
+            out_wd = workdir_for(out)
+            (out_wd / "words.json").write_text(
+                json.dumps(remapped, indent=2, ensure_ascii=True), encoding="ascii")
+        except Exception:
+            pass  # non-fatal — worst case job_edit re-transcribes as before
         j["clean_original"] = total
         j["clean_new"] = sum(b - a for a, b in keeps)
         j["clean_silences"] = len(silences)
@@ -440,6 +1337,120 @@ def job_clean(sid):
         import traceback
         j["status"] = "clean:error"; j["error"] = str(e); j["trace"] = traceback.format_exc()
         log_error(sid, "clean", str(e))
+
+
+def job_audio_only_finish(sid):
+    """Cheap re-run for a pure denoise/enhance tweak — reapplies just the
+    audio filter to the raw (unfiltered) intermediate saved by the last full
+    clean, with the video stream copied untouched instead of re-encoded.
+    `raw` here is whatever the video currently is — the plain cut
+    (job_clean_finish's output) if camera effects were never applied, or the
+    stabilize/camera_movement-processed version if job_apply_camera_effects
+    already ran and swapped it in (that function keeps this exact filename
+    so this path never needs to know or care which one it's looking at).
+    Triggered by /clean/reclean when it detects the only changed settings
+    are denoise_intensity/enhance_intensity."""
+    j = SESSIONS[sid]
+    try:
+        out = Path(j["clean_path"])
+        raw = Path(str(out) + ".raw.mp4")
+        if not raw.exists():
+            # No raw intermediate to work from (e.g. a session started
+            # before this split existed) — fall back to a full re-clean.
+            job_clean_finish(sid)
+            return
+        j["status"] = "clean:splicing"
+        audio_filter = build_audio_chain(j.get("denoise_intensity", 0), j.get("enhance_intensity", 0),
+                                          noise_floor_db=j.get("noise_db"), volume_pct=j.get("volume_pct", 100.0))
+        apply_audio_filter(raw, out, audio_filter)
+        keep_transcript_cache_fresh(out)
+        j["status"] = "clean:done"
+    except Exception as e:
+        import traceback
+        j["status"] = "clean:error"; j["error"] = str(e); j["trace"] = traceback.format_exc()
+        log_error(sid, "clean_audio_only", str(e))
+
+
+def job_apply_camera_effects(sid):
+    """Explicit, separate step: stabilize/camera_movement applied to the
+    ALREADY-CLEANED base video, only when the user asks for it — not
+    automatically bundled into Clean/Re-clean. This is the whole point of
+    the reorder: review the base cut first, then decide whether synthetic
+    camera movement is worth the extra render time on THIS (already short,
+    already final-cut) video, rather than committing to it upfront on the
+    full raw recording. Triggered by POST /clean/apply_camera_effects.
+
+    Operates on the raw (audio-unfiltered) intermediate, not clean_path
+    itself, and overwrites it in place under the SAME filename — so
+    job_audio_only_finish()'s cheap path keeps working completely unchanged
+    afterward, whether or not this ever ran."""
+    j = SESSIONS[sid]
+    if not j.get("clean_path"):
+        j["status"] = "clean:error"; j["error"] = "No cleaned video yet — run Clean first."
+        return
+    out = Path(j["clean_path"])
+    raw = Path(str(out) + ".raw.mp4")
+    if not raw.exists():
+        j["status"] = "clean:error"; j["error"] = "Missing raw intermediate — re-run Clean first."
+        return
+    try:
+        processed = apply_stabilize_and_camera_movement(sid, raw)
+        if processed is None:
+            return  # error status already set
+        if processed != raw:
+            processed.replace(raw)
+        audio_filter = build_audio_chain(j.get("denoise_intensity", 0), j.get("enhance_intensity", 0),
+                                          noise_floor_db=j.get("noise_db"), volume_pct=j.get("volume_pct", 100.0))
+        apply_audio_filter(raw, out, audio_filter)
+        keep_transcript_cache_fresh(out)
+        j["status"] = "clean:done"
+    except Exception as e:
+        import traceback
+        j["status"] = "clean:error"; j["error"] = str(e); j["trace"] = traceback.format_exc()
+        log_error(sid, "camera_effects", str(e))
+
+
+RENDER_PROGRESS_RE = re.compile(r"Rendered (\d+)/(\d+)")
+ENCODE_PROGRESS_RE = re.compile(r"Encoded (\d+)/(\d+)")
+
+
+def run_render_streaming(cmd, env, cwd, sess):
+    """Same job as subprocess.run(capture_output=True), but reads stdout line
+    by line as it arrives instead of buffering until the process exits — so
+    render.sh's "Rendered N/1033" / "Encoded N/1033" lines update sess in
+    real time instead of only being visible after the whole render finishes.
+    Returns an object with .returncode and .output (joined tail), same shape
+    the callers already expect from subprocess.run's result."""
+    sess["render_progress"] = {"phase": "starting", "current": 0, "total": 0}
+    proc = subprocess.Popen(cmd, env=env, cwd=cwd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True,
+                            encoding="utf-8", errors="replace", bufsize=1)
+    lines = []
+    start_time = time.time()
+    for line in proc.stdout:
+        lines.append(line)
+        if len(lines) > 400: lines.pop(0)  # keep a bounded tail for error messages
+        m = RENDER_PROGRESS_RE.search(line)
+        if m:
+            cur, tot = int(m.group(1)), int(m.group(2))
+            elapsed = time.time() - start_time
+            rate = cur / elapsed if elapsed > 0 and cur > 0 else 0
+            eta = (tot - cur) / rate if rate > 0 else None
+            sess["render_progress"] = {"phase": "rendering", "current": cur, "total": tot,
+                                        "eta_sec": round(eta) if eta is not None else None}
+            continue
+        m = ENCODE_PROGRESS_RE.search(line)
+        if m:
+            cur, tot = int(m.group(1)), int(m.group(2))
+            sess["render_progress"] = {"phase": "encoding", "current": cur, "total": tot, "eta_sec": None}
+    proc.wait()
+    sess["render_progress"] = {"phase": "done", "current": 0, "total": 0, "eta_sec": None}
+
+    class Result:
+        returncode = proc.returncode
+        stdout = "".join(lines)
+        stderr = ""
+    return Result()
 
 
 def job_edit(sid):
@@ -458,25 +1469,26 @@ def job_edit(sid):
     wd = workdir_for(src); j["edit_workdir"] = str(wd)
     j["status"] = "edit:planning"
     try:
-        words = transcribe(src, wd)
+        words = transcribe(src, wd, sess=j)
         plan = generate_plan(words)
-        (wd / "broll_plan.json").write_text(json.dumps(plan, indent=2, ensure_ascii=True), encoding="ascii")
+        write_json_atomic(wd / "broll_plan.json", plan)
         j["plan"] = plan
         append_chat(sid, "assistant", f"**Plan generated** — {len(plan)} beats: " + ", ".join(b['kind'] for b in plan), "plan")
-        copy_to_render_wd(src, wd)
         j["status"] = "edit:rendering"
         append_chat(sid, "assistant", "Rendering preview (~30s)...", "status")
-        # clear stale locks
-        for p in Path("/tmp").glob("video-edit-render.lock*"):
-            try:
-                if p.is_dir(): shutil.rmtree(p, ignore_errors=True)
-                else: p.unlink(missing_ok=True)
-            except Exception: pass
-        env = {"FORCE_RENDER": "1", "ASPECT": SESSIONS[sid].get("aspect", "auto"), **dict(os.environ)}
-        r = subprocess.run(["bash", str(RENDER_SH), str(src)], env=env, cwd=str(SKILL),
-                           capture_output=True, text=True)
+        # NOTE: used to unconditionally delete /tmp/video-edit-render.lock*
+        # here "just in case" — that's wrong. render.sh's own lock is already
+        # PID-aware and self-healing (steals a stale lock automatically); this
+        # code was blindly deleting it even when a DIFFERENT render was still
+        # legitimately holding it, letting two renders run concurrently and
+        # race on the same broll_plan.json / words.json via the in-place
+        # rewrite scripts (align_to_speech.py etc) — the actual cause of the
+        # repeated 0-byte plan corruption. Just let render.sh's own lock work.
+        env = {**dict(os.environ), "FORCE_RENDER": "1", "ASPECT": SESSIONS[sid].get("aspect", "auto"),
+               "STUDIO_WORKDIR": str(wd)}
+        r = run_render_streaming([BASH, str(RENDER_SH), str(src)], env, str(SKILL), j)
         if r.returncode != 0:
-            tail = (r.stderr or r.stdout or "")[-600:]
+            tail = (r.stdout or "")[-600:]
             j["status"] = "edit:error"; j["error"] = f"render exit {r.returncode}"
             log_error(sid, "render", tail)
             append_chat(sid, "assistant", f"**Render failed** (exit {r.returncode}). See ⚠ error log for details.", "error")
@@ -499,11 +1511,17 @@ def job_final(sid):
         cand = Path.home() / "Downloads" / Path(j.get("clean_path") or j["src"]).name
         if cand.exists(): src = cand.resolve()
     try:
-        env = {"QUALITY": "final", "FORCE_RENDER": "1", "ASPECT": SESSIONS[sid].get("aspect", "auto"), **dict(os.environ)}
-        _run(["bash", str(RENDER_SH), str(src)], check=True, env=env, cwd=str(SKILL))
+        wd = edit_workdir_for(j)
+        env = {**dict(os.environ), "QUALITY": "final", "FORCE_RENDER": "1",
+               "ASPECT": SESSIONS[sid].get("aspect", "auto"), "STUDIO_WORKDIR": str(wd)}
+        r = run_render_streaming([BASH, str(RENDER_SH), str(src)], env, str(SKILL), j)
+        if r.returncode != 0:
+            j["status"] = "export:error"; j["error"] = f"render exit {r.returncode}: {(r.stdout or '')[-600:]}"
+            log_error(sid, "export", j["error"]); return
         final = src.parent / f"{src.stem}.enhanced.mp4"
         if final.exists():
             j["final_path"] = str(final); j["status"] = "export:done"
+            save_project(sid)  # auto-save on export
     except Exception as e:
         j["status"] = "export:error"; j["error"] = str(e)
 
@@ -524,6 +1542,38 @@ DEFAULT_BEAT_FIELDS = {
     "bullet_burst": {"items": [{"text": "Bullet 1", "appear_sec": 0}, {"text": "Bullet 2", "appear_sec": 0}]},
     "portrait_burst": {"items": [{"image_path": "broll/face.jpg", "label": "Name", "appear_sec": 0}]},
     "ratio_dots": {"total": 12, "marked": 9, "polarity": "negative", "caption": "ITEMS"},
+    "ring_chart": {"title": "TITLE", "holeRatio": 0.6, "segments": [
+        {"label": "A", "value": 60}, {"label": "B", "value": 25}, {"label": "C", "value": 15}]},
+    "countdown_reveal": {"steps": ["3", "2", "1", "GO"], "subtitle": ""},
+    "logo_reveal_hero": {"image_path": "anthropic.png", "name": "BRAND", "tagline": ""},
+    "logo_reveal_style": {"image_path": "anthropic.png", "name": "BRAND", "tagline": "", "style": "bounce"},
+    "image_compare_slider": {"before_image": "broll/before.jpg", "after_image": "broll/after.jpg",
+        "before_label": "BEFORE", "after_label": "AFTER"},
+    "end_card": {"title": "THAT'S IT", "subtitle": "", "cta": "SUBSCRIBE"},
+    "gallery_grid": {"images": ["broll/1.jpg", "broll/2.jpg", "broll/3.jpg"], "caption": ""},
+    "image_carousel": {"images": ["broll/1.jpg", "broll/2.jpg"], "labels": [], "slot_sec": 1.4},
+    "image_zoom_reveal": {"image": "broll/placeholder.jpg", "caption": ""},
+    "masonry_gallery": {"images": ["broll/1.jpg", "broll/2.jpg", "broll/3.jpg"], "caption": ""},
+    "photo_stack": {"images": ["broll/1.jpg", "broll/2.jpg", "broll/3.jpg"], "captions": []},
+    "picture_in_picture": {"main_image": "broll/main.jpg", "pip_image": "broll/pip.jpg", "pip_label": ""},
+    "polaroid_frame": {"image": "broll/placeholder.jpg", "caption": ""},
+    "split_panels": {"left_image": "broll/left.jpg", "right_image": "broll/right.jpg", "left_label": "", "right_label": ""},
+    "area_chart": {"title": "TITLE", "chart_points": [{"label": "Jan", "value": 10}, {"label": "Feb", "value": 40}, {"label": "Mar", "value": 65}]},
+    "progress_bars": {"title": "TITLE", "bars": [{"label": "A", "value": 80}, {"label": "B", "value": 55}]},
+    "stat_delta": {"target": 100, "prefix": "$", "delta_value": "12.5%", "delta_direction": "up", "delta_label": "This Month"},
+    "comparison_bars": {"before_label": "BEFORE", "after_label": "AFTER", "comparison_rows": [{"label": "Speed", "before": 30, "after": 90}]},
+    "circular_progress": {"value_pct": 75, "title": "PROGRESS"},
+    "bounce_title": {"title": "TITLE", "subtitle": ""},
+    "bubble_pop_text": {"quote_text": "POP THIS"},
+    "pop_text": {"quote_text": "POP THIS"},
+    "pulse_text": {"quote_text": "PULSE THIS"},
+    "text_sweep": {"quote_text": "highlight these words as read"},
+    "typewriter_text": {"quote_text": "typing this out...", "chars_per_second": 12},
+    "list_reveal": {"title": "TITLE", "items": [{"text": "Item one"}, {"text": "Item two"}]},
+    "card_flip": {"front_text": "FRONT", "back_text": "BACK", "flip_sec": 1.5},
+    "notification_stack": {"notifications": [{"app_name": "App", "title": "Title", "body": "Body", "time": "now"}]},
+    "carousel_3d": {"title": "TITLE", "carousel_items": [{"label": "A"}, {"label": "B"}, {"label": "C"}]},
+    "sound_wave": {"bar_count": 24, "caption": ""},
 }
 
 PLAN_TEMPLATES = {
@@ -572,8 +1622,7 @@ PLAN_TEMPLATES = {
 def get_plan_path(sid: str) -> Path | None:
     sess = SESSIONS.get(sid)
     if not sess: return None
-    wd = Path(sess.get("edit_workdir") or sess.get("workdir") or "")
-    return wd / "broll_plan.json" if wd else None
+    return edit_workdir_for(sess) / "broll_plan.json"
 
 
 def load_plan(sid: str) -> list:
@@ -584,21 +1633,31 @@ def load_plan(sid: str) -> list:
     return []
 
 
+def write_json_atomic(path: Path, data) -> None:
+    """Write-then-rename so a crash or a race with another writer can never
+    leave a truncated (0-byte) file — os.replace is atomic on both Windows
+    and POSIX. Hit this exact corruption 4 times before adding this."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=True), encoding="ascii")
+    os.replace(tmp, path)
+
+
 def save_plan(sid: str, plan: list, push_history: bool = True):
     p = get_plan_path(sid)
     if not p: return
+    if not plan and p.exists() and p.stat().st_size > 2:
+        # refuse to silently clobber a real plan with an empty one — this is
+        # exactly the failure mode that kept corrupting broll_plan.json
+        log_error(sid, "save_plan", "refused to overwrite non-empty plan with []")
+        return
     if push_history:
         cur = load_plan(sid)
         PLAN_HISTORY.setdefault(sid, []).append(cur)
         if len(PLAN_HISTORY[sid]) > 30:
             PLAN_HISTORY[sid] = PLAN_HISTORY[sid][-30:]
         PLAN_FUTURE[sid] = []
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(plan, indent=2, ensure_ascii=True), encoding="ascii")
-    # mirror to render.sh's workdir variants
-    sess = SESSIONS.get(sid)
-    if sess and sess.get("clean_path"):
-        copy_to_render_wd(Path(sess["clean_path"]).resolve(), p.parent)
+    write_json_atomic(p, plan)
 
 
 def list_music_tracks() -> list[str]:
@@ -649,8 +1708,7 @@ def pexels_search(query: str, portrait: bool = True) -> list[dict]:
 def pexels_download(url: str, sid: str, name: str) -> str | None:
     sess = SESSIONS.get(sid)
     if not sess: return None
-    wd = Path(sess.get("edit_workdir") or sess.get("workdir") or "")
-    if not wd: return None
+    wd = edit_workdir_for(sess)
     broll = wd / "broll"; broll.mkdir(exist_ok=True)
     import urllib.request
     safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", name)[:40] + ".jpg"
@@ -662,15 +1720,25 @@ def pexels_download(url: str, sid: str, name: str) -> str | None:
         return None
 
 
-def launch_studio():
+def _already_listening(port: int) -> bool:
     s = socket.socket()
     try:
-        s.bind(("127.0.0.1", 3001)); s.close()
-        subprocess.Popen(["npx", "--no-install", "remotion", "studio", "src/index.ts", "--port", "3001"],
-                         cwd=str(SKILL / "remotion"))
-        return True
+        s.bind(("127.0.0.1", port)); s.close(); return False
     except OSError:
-        s.close(); return False
+        s.close(); return True
+
+
+def launch_studio():
+    if _already_listening(REMOTION_STUDIO_PORT): return True  # already running, nothing to do
+    npx = shutil.which("npx")  # resolves npx.cmd on Windows — Popen(["npx",...]) can't
+    if not npx:
+        log_error("system", "launch_studio", "npx not found on PATH"); return False
+    try:
+        subprocess.Popen([npx, "--no-install", "remotion", "studio", "src/index.ts", "--port", str(REMOTION_STUDIO_PORT)],
+                         cwd=str(SKILL / "remotion"), shell=(os.name == "nt"))
+        return True
+    except Exception as e:
+        log_error("system", "launch_studio", str(e)); return False
 
 
 ERROR_LOG: list[dict] = []  # recent errors across all sessions
@@ -680,55 +1748,112 @@ def log_error(sid: str, where: str, msg: str):
     if len(ERROR_LOG) > 100: del ERROR_LOG[:-100]
 
 
+def next_project_name(date_str: str) -> str:
+    """CapCut-style dated name: 0207, then 0207 (1), 0207 (2), ... on collision."""
+    if not (PROJECTS_DIR / date_str).exists():
+        return date_str
+    i = 1
+    while (PROJECTS_DIR / f"{date_str} ({i})").exists():
+        i += 1
+    return f"{date_str} ({i})"
+
+
 def save_project(sid: str) -> Path | None:
+    """Snapshot the project into its OWN folder: project.json + thumb.jpg +
+    copies of clean/preview/final mp4 + a copy of the whole edit workdir
+    (plan, transcript, captions, broll assets). Re-cleaning or re-editing the
+    SAME source video later overwrites the shared <stem>.clean.mp4 /
+    <stem>.preview.mp4 filenames next to the source — without this snapshot,
+    reopening an older saved project would silently show whatever the LATEST
+    work produced instead of what was actually saved. This is the fix for
+    that: every save is a self-contained folder nothing else can mutate."""
     sess = SESSIONS.get(sid)
     if not sess: return None
-    src = Path(sess.get("src") or sess.get("clean_path") or "")
+    src = Path(sess.get("clean_path") or sess.get("src") or "")
     if not src.exists(): return None
-    wd = Path(sess.get("workdir") or workdir_for(src))
-    proj = wd / "project.studio.json"
+    name = sess.get("_project_name")
+    if not name:
+        name = next_project_name(time.strftime("%m%d"))
+        sess["_project_name"] = name
+    proj_dir = PROJECTS_DIR / name
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    proj = proj_dir / "project.json"
+    thumb = proj_dir / "thumb.jpg"
+
     snapshot = {k: v for k, v in sess.items()
                 if k not in ("waveform", "words")}  # heavy, derivable
+
+    for key, fname in (("clean_path", "clean.mp4"), ("preview_path", "preview.mp4"),
+                       ("final_path", "final.mp4")):
+        p = sess.get(key)
+        if p and Path(p).exists():
+            dst = proj_dir / fname
+            try:
+                shutil.copy2(p, dst); snapshot[key] = str(dst)
+            except Exception: pass
+
+    live_wd = edit_workdir_for(sess)
+    if live_wd.exists() and live_wd.is_dir():
+        snap_wd = proj_dir / "workdir"
+        try:
+            shutil.copytree(live_wd, snap_wd, dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("*.mp4", "*.wav"))
+            snapshot["workdir"] = str(snap_wd)
+            snapshot["edit_workdir"] = str(snap_wd)
+        except Exception: pass
+
     snapshot["saved_at"] = time.time()
-    snapshot["src"] = str(src)
-    snapshot["thumbnail_at"] = 1.0  # extract a frame at 1s for thumbnail
+    snapshot["src"] = snapshot.get("clean_path") or str(src)
+    snapshot["_plan_history"] = PLAN_HISTORY.get(sid, [])
+    snapshot["_plan_future"] = PLAN_FUTURE.get(sid, [])
     proj.write_text(json.dumps(snapshot, indent=2, ensure_ascii=True), encoding="ascii")
-    # extract a small thumbnail jpg
-    thumb = wd / "thumb.jpg"
-    try:
-        subprocess.run(["ffmpeg", "-y", "-ss", "1", "-i", str(src), "-frames:v", "1",
-                        "-vf", "scale=320:-1", str(thumb)],
-                       check=False, capture_output=True, timeout=15)
-    except Exception: pass
+
+    thumb_src = Path(snapshot.get("clean_path") or snapshot.get("src") or "")
+    if thumb_src.exists():
+        try:
+            subprocess.run(["ffmpeg", "-y", "-ss", "1", "-i", str(thumb_src), "-frames:v", "1",
+                            "-vf", "scale=320:-1", str(thumb)],
+                           check=False, capture_output=True, timeout=15)
+        except Exception: pass
     return proj
 
 
 def load_project(proj_path: Path) -> str | None:
-    """Load a saved project, return new sid."""
+    """Load a saved project, return new sid. All paths in the snapshot already
+    point inside the project's own folder — nothing needs regenerating."""
     if not proj_path.exists(): return None
     snap = json.loads(proj_path.read_text(encoding="utf-8"))
     sid = uuid.uuid4().hex
+    PLAN_HISTORY[sid] = snap.pop("_plan_history", [])
+    PLAN_FUTURE[sid] = snap.pop("_plan_future", [])
     SESSIONS[sid] = snap
-    # re-derive transcript if needed
-    src = Path(snap.get("src", ""))
-    wd = Path(snap.get("workdir") or workdir_for(src))
+    snap["_project_name"] = proj_path.parent.name  # so re-save overwrites, not duplicates
+    wd = Path(snap.get("workdir") or "")
     if (wd / "words.json").exists():
         try: SESSIONS[sid]["words"] = json.loads((wd / "words.json").read_text(encoding="utf-8"))
         except: pass
     return sid
 
 
+def delete_project(proj_path: Path) -> bool:
+    try:
+        proj_dir = proj_path.parent
+        if proj_path.exists() and proj_dir.parent == PROJECTS_DIR:
+            shutil.rmtree(proj_dir); return True
+    except Exception: pass
+    return False
+
+
 def list_projects() -> list[dict]:
     out = []
-    if not WORK_ROOT.exists(): return out
-    for proj in WORK_ROOT.glob("*/project.studio.json"):
+    for proj in PROJECTS_DIR.glob("*/project.json"):
         try:
             d = json.loads(proj.read_text(encoding="utf-8"))
             src = d.get("src", "")
             out.append({
                 "path": str(proj),
-                "name": Path(src).name if src else proj.parent.name,
-                "src": src,
+                "name": proj.parent.name,
+                "video_name": Path(src).name if src else "",
                 "saved_at": d.get("saved_at", 0),
                 "status": d.get("status", "?"),
                 "thumb": str(proj.parent / "thumb.jpg") if (proj.parent / "thumb.jpg").exists() else None,
@@ -748,20 +1873,14 @@ def _just_render(sid: str):
     sess["plan"] = load_plan(sid)
     sess["status"] = "edit:rendering"
     src = Path(sess.get("clean_path") or sess["src"]).resolve()
-    wd = Path(sess.get("edit_workdir") or sess.get("workdir") or "")
-    if wd: copy_to_render_wd(src, wd)
-    # clear any stale render lock
-    for p in Path("/tmp").glob("video-edit-render.lock*"):
-        try:
-            if p.is_dir(): shutil.rmtree(p, ignore_errors=True)
-            else: p.unlink(missing_ok=True)
-        except Exception: pass
+    wd = edit_workdir_for(sess)
+    # render.sh's own lock is PID-aware and self-healing — don't clear it here
     try:
-        env = {"FORCE_RENDER": "1", "ASPECT": SESSIONS[sid].get("aspect", "auto"), **dict(os.environ)}
-        r = subprocess.run(["bash", str(RENDER_SH), str(src)], env=env, cwd=str(SKILL),
-                           capture_output=True, text=True)
+        env = {**dict(os.environ), "FORCE_RENDER": "1", "ASPECT": SESSIONS[sid].get("aspect", "auto"),
+               "STUDIO_WORKDIR": str(wd)}
+        r = run_render_streaming([BASH, str(RENDER_SH), str(src)], env, str(SKILL), sess)
         if r.returncode != 0:
-            tail = (r.stderr or r.stdout or "")[-800:]
+            tail = (r.stdout or "")[-800:]
             sess["status"] = "edit:error"
             sess["error"] = f"render exit {r.returncode}: {tail}"
             log_error(sid, "render", sess["error"])
@@ -778,14 +1897,32 @@ def _just_render(sid: str):
         log_error(sid, "render", str(e))
 
 
-def launch_tuner():
-    s = socket.socket()
-    try:
-        s.bind(("127.0.0.1", 5050)); s.close()
-        subprocess.Popen(["python3", str(SKILL / "scripts/position_tuner.py")])
+_TUNER_PROC = {"proc": None, "workdir": None}
+
+
+def launch_tuner(workdir: str | None = None):
+    # the tuner is a single long-running process pointed at one workdir — if
+    # it's already up for a DIFFERENT project, restart it against the current
+    # one instead of leaving it silently stale.
+    if _TUNER_PROC["proc"] is not None and _TUNER_PROC["workdir"] == workdir \
+            and _TUNER_PROC["proc"].poll() is None:
+        return True  # already running for this exact project
+    if _TUNER_PROC["proc"] is not None and _TUNER_PROC["proc"].poll() is None:
+        _TUNER_PROC["proc"].terminate()
+        try: _TUNER_PROC["proc"].wait(timeout=3)
+        except Exception: pass
+    elif _already_listening(TUNER_PORT):
+        # something else is bound to this port (e.g. a manual launch) — leave it alone
         return True
-    except OSError:
-        s.close(); return False
+    try:
+        env = dict(os.environ)
+        if workdir: env["VIDEO_STUDIO_WORKDIR"] = workdir
+        env["TUNER_PORT"] = str(TUNER_PORT)
+        proc = subprocess.Popen([sys.executable, str(SKILL / "scripts/position_tuner.py")], env=env)
+        _TUNER_PROC["proc"] = proc; _TUNER_PROC["workdir"] = workdir
+        return True
+    except Exception as e:
+        log_error("system", "launch_tuner", str(e)); return False
 
 
 HTML_PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><title>Video Studio</title>
@@ -842,7 +1979,7 @@ input[type=number]{width:64px;background:#0F121A;border:1px solid #343E5B;color:
 .stat .v{font-size:20px;color:#CFFF05;font-weight:800;font-family:monospace}
 .stat .l{font-size:10px;color:#7a8497;text-transform:uppercase;letter-spacing:.06em;margin-top:4px}
 .dl{display:block;text-align:center;padding:14px;background:#CFFF05;color:#0F121A;border-radius:8px;font-weight:800;text-decoration:none;margin-top:14px;text-transform:uppercase;font-size:13px}
-.player{width:100%;border-radius:8px;background:#000;margin-top:12px}
+.player{max-width:100%;max-height:65vh;width:auto;height:auto;display:block;margin:12px auto 0;border-radius:8px;background:#000}
 .actrow{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}
 .hidden{display:none}
 .chat{max-height:300px;overflow-y:auto;background:#0F121A;border-radius:8px;padding:12px;margin-bottom:12px}
@@ -945,26 +2082,44 @@ input[type=number]{width:64px;background:#0F121A;border:1px solid #343E5B;color:
     <h2>What to remove</h2>
     <div class="toggles">
       <div class="toggle on" data-key="cut_head"><div class="lbl">Cut head silence<small>Trim dead air at start</small></div><div class="switch"></div></div>
+      <div class="row"><label>Head buffer<small>seconds of pause kept before speech starts</small></label>
+        <input type="range" id="headbuf" min="0" max="2" step="0.1" value="0.5" oninput="document.getElementById('n-headbuf').value=this.value">
+        <input type="number" id="n-headbuf" value="0.5" step="0.1" min="0" oninput="document.getElementById('headbuf').value=this.value"></div>
       <div class="toggle on" data-key="cut_tail"><div class="lbl">Cut tail silence<small>Trim dead air at end</small></div><div class="switch"></div></div>
+      <div class="row"><label>Tail buffer<small>seconds of pause kept after speech ends</small></label>
+        <input type="range" id="tailbuf" min="0" max="2" step="0.1" value="0.5" oninput="document.getElementById('n-tailbuf').value=this.value">
+        <input type="number" id="n-tailbuf" value="0.5" step="0.1" min="0" oninput="document.getElementById('tailbuf').value=this.value"></div>
       <div class="toggle on" data-key="remove_retakes"><div class="lbl">Remove retakes<small>Detect repeated phrases, keep last take</small></div><div class="switch"></div></div>
       <div class="toggle" data-key="remove_clicks"><div class="lbl">Remove clicks &amp; pops<small>Short transients between silences</small></div><div class="switch"></div></div>
+      <div class="toggle" data-key="stabilize"><div class="lbl">Stabilize video<small>Smooth handheld camera shake (adds render time)</small></div><div class="switch"></div></div>
+      <div class="row"><label>Camera movement<small>CapCut-style synthetic motion on static footage. Dynamic follows the speaker's face.</small></label>
+        <select id="camera_movement" style="flex:1;background:#1E2434;border:1px solid #343E5B;color:#E9ECED;padding:7px 9px;border-radius:5px;font-size:12px">
+          <option value="none">None</option>
+          <option value="zoom">Zoom — slow zoom in</option>
+          <option value="shake">Shake — simulated handheld</option>
+          <option value="soft">Soft — gentle ambient drift</option>
+          <option value="dynamic">Dynamic — follows the speaker's face</option>
+        </select></div>
     </div>
   </div>
   <div class="card">
-    <h2>Audio enhancement</h2>
+    <h2>Audio enhancement <span style="color:#7a8497;font-size:9px;font-weight:400;text-transform:none;letter-spacing:0;margin-left:8px">volume &amp; enhance update the preview live, no render needed &middot; denoise needs a quick reprocess</span></h2>
+    <div class="row"><label>Volume<small>% of original, live preview</small></label>
+      <input type="range" id="volume" min="0" max="200" step="5" value="100" oninput="document.getElementById('n-volume').value=this.value; onAudioParamInput()">
+      <input type="number" id="n-volume" value="100" min="0" max="200" step="5" oninput="document.getElementById('volume').value=this.value; onAudioParamInput()"></div>
     <div class="row"><label>Background noise removal<small>RNNoise + spectral denoise. 0 = off</small></label>
-      <input type="range" id="denoise" min="0" max="1" step="0.05" value="0" oninput="document.getElementById('n-denoise').value=this.value">
-      <input type="number" id="n-denoise" value="0" min="0" max="1" step="0.05" oninput="document.getElementById('denoise').value=this.value"></div>
+      <input type="range" id="denoise" min="0" max="1" step="0.05" value="0" oninput="document.getElementById('n-denoise').value=this.value; onAudioParamInput()">
+      <input type="number" id="n-denoise" value="0" min="0" max="1" step="0.05" oninput="document.getElementById('denoise').value=this.value; onAudioParamInput()"></div>
     <div class="row"><label>Studio sound enhance<small>EQ + compress + loudness norm. 0 = off</small></label>
-      <input type="range" id="enhance" min="0" max="1" step="0.05" value="0" oninput="document.getElementById('n-enhance').value=this.value">
-      <input type="number" id="n-enhance" value="0" min="0" max="1" step="0.05" oninput="document.getElementById('enhance').value=this.value"></div>
+      <input type="range" id="enhance" min="0" max="1" step="0.05" value="0" oninput="document.getElementById('n-enhance').value=this.value; onAudioParamInput()">
+      <input type="number" id="n-enhance" value="0" min="0" max="1" step="0.05" oninput="document.getElementById('enhance').value=this.value; onAudioParamInput()"></div>
   </div>
   <div class="card hidden" id="wf-card">
     <h2>Waveform <span style="color:#7a8497;font-size:9px;font-weight:400;text-transform:none;letter-spacing:0;margin-left:8px">red = silences cut</span></h2>
     <canvas id="wf" style="width:100%;height:120px;background:#0F121A;border-radius:6px;display:block"></canvas>
   </div>
   <div class="card hidden" id="tr-card">
-    <h2>Transcript editor <span style="color:#7a8497;font-size:9px;font-weight:400;text-transform:none;letter-spacing:0;margin-left:8px">click word to delete &middot; click again to restore</span></h2>
+    <h2>Transcript editor <span style="color:#7a8497;font-size:9px;font-weight:400;text-transform:none;letter-spacing:0;margin-left:8px">click word to delete &middot; click again to restore &middot; double-click to fix wrong text</span></h2>
     <div id="tr-words" style="line-height:2.2;font-size:13px;max-height:240px;overflow-y:auto;padding:8px;background:#0F121A;border-radius:6px"></div>
     <div id="tr-cuts" style="margin-top:10px;font-size:11px;color:#7a8497"></div>
   </div>
@@ -1011,6 +2166,36 @@ input[type=number]{width:64px;background:#0F121A;border:1px solid #343E5B;color:
         <option value="bullet_burst">bullet_burst</option>
         <option value="ratio_dots">ratio_dots</option>
         <option value="subscribe">subscribe</option>
+        <option value="ring_chart">ring_chart (pie/donut)</option>
+        <option value="countdown_reveal">countdown_reveal</option>
+        <option value="logo_reveal_hero">logo_reveal_hero</option>
+        <option value="logo_reveal_style">logo_reveal_style</option>
+        <option value="image_compare_slider">image_compare_slider</option>
+        <option value="end_card">end_card</option>
+        <option value="gallery_grid">gallery_grid</option>
+        <option value="image_carousel">image_carousel</option>
+        <option value="image_zoom_reveal">image_zoom_reveal</option>
+        <option value="masonry_gallery">masonry_gallery</option>
+        <option value="photo_stack">photo_stack</option>
+        <option value="picture_in_picture">picture_in_picture</option>
+        <option value="polaroid_frame">polaroid_frame</option>
+        <option value="split_panels">split_panels</option>
+        <option value="area_chart">area_chart (gradient trend line)</option>
+        <option value="progress_bars">progress_bars (skill/metric bars)</option>
+        <option value="stat_delta">stat_delta (count-up + delta chip)</option>
+        <option value="comparison_bars">comparison_bars (before/after rows)</option>
+        <option value="circular_progress">circular_progress (ring meter)</option>
+        <option value="bounce_title">bounce_title (spring bounce title)</option>
+        <option value="bubble_pop_text">bubble_pop_text (chars in bubbles)</option>
+        <option value="pop_text">pop_text (neon scale-pop text)</option>
+        <option value="pulse_text">pulse_text (breathing glow text)</option>
+        <option value="text_sweep">text_sweep (word highlight sweep)</option>
+        <option value="typewriter_text">typewriter_text (typing + cursor)</option>
+        <option value="list_reveal">list_reveal (compact stagger list)</option>
+        <option value="card_flip">card_flip (3D card flip)</option>
+        <option value="notification_stack">notification_stack (stacked toasts)</option>
+        <option value="carousel_3d">carousel_3d (orbiting 3D cards)</option>
+        <option value="sound_wave">sound_wave (audio waveform bars)</option>
       </select>
       <button onclick="addBeat()">+ Add beat</button>
       <span style="color:#7a8497;font-size:11px">Drag beats to move · drag edges to resize · click to edit</span>
@@ -1066,8 +2251,8 @@ input[type=number]{width:64px;background:#0F121A;border:1px solid #343E5B;color:
       </ul>
       <p style="margin-top:14px"><strong style="color:var(--accent)">Tools:</strong></p>
       <ul style="margin-left:18px;font-size:12px">
-        <li><strong>Remotion Studio (:3001)</strong> — live preview of rendered comp w/ HMR on template edits</li>
-        <li><strong>Position Tuner (:5050)</strong> — slider-based placement tuning for every overlay</li>
+        <li><strong>Remotion Studio (:5057)</strong> — live preview of rendered comp w/ HMR on template edits</li>
+        <li><strong>Position Tuner (:5058)</strong> — slider-based placement tuning for every overlay</li>
       </ul>
     </div>
   </div>
@@ -1100,6 +2285,28 @@ input[type=number]{width:64px;background:#0F121A;border:1px solid #343E5B;color:
 const $ = id => document.getElementById(id);
 let sid = null;
 let preset = 'standard';
+function setSid(newSid){
+  sid = newSid;
+  if(sid) localStorage.setItem('activeSid', sid);
+  else localStorage.removeItem('activeSid');
+}
+// Resume the live session after an accidental reload (Ctrl+R, F5, etc).
+// Only works while the server process hasn't restarted — SESSIONS is
+// in-memory. If the server DID restart, /state 404s and we just clear the
+// stale id and land on a blank Clean tab, same as before this existed.
+(async function resumeSession(){
+  const saved = localStorage.getItem('activeSid');
+  if(!saved) return;
+  try{
+    const r = await fetch('/state?sid='+saved);
+    if(!r.ok){ localStorage.removeItem('activeSid'); return; }
+    const state = await r.json();
+    if(state.error){ localStorage.removeItem('activeSid'); return; }
+    setSid(saved);
+    toast('Resumed your session');
+    hydrateProject(state);
+  } catch(e){ /* server not reachable yet — leave it, next reload will retry */ }
+})();
 
 function tab(name){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
@@ -1108,6 +2315,18 @@ function tab(name){
   $('t-'+name).classList.remove('hidden');
   if(name==='dash') loadProjects();
 }
+// Browsers throttle setTimeout heavily in a backgrounded tab (sometimes to
+// once every several seconds, occasionally further) -- during a multi-minute
+// stabilize/camera-movement/splice render, alt-tabbing away and back made the
+// visible progress bar look frozen even though the server had moved on and
+// finished, confirmed directly by forcing a poll manually. Firing one poll
+// immediately on refocus re-syncs the UI without waiting on the throttled timer.
+document.addEventListener('visibilitychange', () => {
+  if(document.hidden || !sid) return;
+  if(!$('t-clean').classList.contains('hidden')) pollClean();
+  if(!$('t-edit').classList.contains('hidden')) pollEdit();
+  if(!$('t-export').classList.contains('hidden')) pollFinal();
+});
 function toggleTheme(){
   document.body.classList.toggle('light');
   localStorage.setItem('theme', document.body.classList.contains('light')?'light':'dark');
@@ -1139,8 +2358,12 @@ async function loadProjects(){
     div.onmouseenter = ()=>div.style.borderColor='var(--accent)';
     div.onmouseleave = ()=>div.style.borderColor='var(--border)';
     div.innerHTML = `${p.thumb?`<img src="/thumb?p=${encodeURIComponent(p.thumb)}" style="width:100%;height:120px;object-fit:cover;border-radius:5px;margin-bottom:8px">`:'<div style="width:100%;height:120px;background:#000;border-radius:5px;margin-bottom:8px;display:flex;align-items:center;justify-content:center;font-size:30px">🎬</div>'}
-      <div style="font-size:12px;color:var(--text);font-weight:600;text-overflow:ellipsis;overflow:hidden;white-space:nowrap" title="${esc(p.src)}">${esc(p.name)}</div>
-      <div style="font-size:10px;color:var(--dim);margin-top:4px">${new Date(p.saved_at*1000).toLocaleString()} · ${p.status}</div>`;
+      <div style="font-size:13px;color:var(--text);font-weight:700">${esc(p.name)}</div>
+      <div style="font-size:11px;color:var(--muted);text-overflow:ellipsis;overflow:hidden;white-space:nowrap;margin-top:2px" title="${esc(p.video_name)}">${esc(p.video_name)}</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px">
+        <div style="font-size:10px;color:var(--dim)">${new Date(p.saved_at*1000).toLocaleString()} · ${p.status}</div>
+        <button onclick="deleteProject(event,'${p.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")}')" style="background:none;border:1px solid #5b2a2a;color:#ffb3b3;padding:2px 8px;border-radius:4px;font-size:10px;cursor:pointer">Delete</button>
+      </div>`;
     div.onclick = ()=>openProject(p.path);
     grid.appendChild(div);
   });
@@ -1148,7 +2371,53 @@ async function loadProjects(){
 async function openProject(path){
   const r = await fetch('/project/open',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({path})});
   const j = await r.json();
-  if(j.sid){ sid = j.sid; toast('Project loaded'); tab('clean'); pollClean(); loadPlan(); loadMusic(); }
+  if(!j.sid){ alert(j.error||'Failed to load project'); return; }
+  setSid(j.sid);
+  const sr = await fetch('/state?sid='+sid); const state = await sr.json();
+  toast('Project loaded');
+  hydrateProject(state);
+}
+async function deleteProject(ev, path){
+  ev.stopPropagation();
+  if(!confirm('Delete this saved project? The video file itself is not touched.')) return;
+  await fetch('/project/delete',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({path})});
+  loadProjects();
+}
+function hydrateProject(j){
+  // knobs
+  const setRange = (id, val) => { if(val==null) return; $(id).value=val; $('n-'+id).value=val; };
+  setRange('noise', j.noise_db); setRange('mingap', j.min_gap); setRange('target', j.target_gap);
+  setRange('denoise', j.denoise_intensity); setRange('enhance', j.enhance_intensity);
+  setRange('volume', j.volume_pct);
+  setRange('headbuf', j.head_buffer_sec); setRange('tailbuf', j.tail_buffer_sec);
+  if(j.camera_movement) $('camera_movement').value = j.camera_movement;
+  ['cut_head','cut_tail','remove_retakes','remove_clicks','stabilize'].forEach(k=>{
+    const el = document.querySelector('.toggle[data-key='+k+']');
+    if(el) el.classList.toggle('on', !!j[k]);
+  });
+  clipQueue = (j.sources && j.sources.length) ? j.sources.slice() : (j.src ? [j.src] : []);
+  renderClips();
+  if(j.aspect) $('aspect-sel').value = j.aspect;
+  // clean tab
+  renderClean(j);
+  if(j.clean_path){ $('edit-path').value = j.clean_path; loadWaveform(); loadTranscript(); }
+  // edit tab
+  if(j.chat) renderChat(j.chat);
+  renderEdit(j);
+  loadPlan(); loadMusic();
+  // export tab
+  if(j.preset){ preset = j.preset; document.querySelectorAll('.preset div').forEach(d=>d.classList.toggle('sel', d.dataset.p===preset)); }
+  if(j.final_path){
+    $('export-result').classList.remove('hidden');
+    $('export-result').innerHTML = `<div class="card"><h2>🎬 Final ready</h2>
+      <video class="player" controls src="/file?p=${encodeURIComponent(j.final_path)}&t=${Date.now()}"></video>
+      <a class="dl" href="/file?p=${encodeURIComponent(j.final_path)}&dl=1" download>Download final .mp4</a></div>`;
+  }
+  // land on whichever tab matches how far the project got
+  const st = j.status || '';
+  if(st.startsWith('export')) tab('export');
+  else if(st.startsWith('edit')) tab('edit');
+  else tab('clean');
 }
 async function pollErrors(){
   try{ const r = await fetch('/errors'); const j = await r.json();
@@ -1226,6 +2495,69 @@ document.querySelectorAll('.preset div').forEach(d=>d.addEventListener('click', 
   d.classList.add('sel'); preset=d.dataset.p;
 }));
 
+// ── Live audio preview (Web Audio API) ──────────────────────────────────
+// Volume and "enhance" (EQ + compressor) both have native real-time Web
+// Audio equivalents, so those can update the PLAYING preview instantly —
+// zero server round-trip, zero render — matching how CapCut's sliders
+// work. Denoise (afftdn, spectral noise removal) has no native browser
+// primitive; it still needs a server-side reprocess pass (the cheap
+// audio-only one from build_audio_chain/apply_audio_filter), which now
+// only fires once, lazily, right before download or moving to Edit —
+// not on every slider tick.
+let audioCtx = null;
+function attachLiveAudio(videoEl){
+  if(!videoEl || videoEl._audioGraph) return videoEl && videoEl._audioGraph;
+  if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  try{
+    const source = audioCtx.createMediaElementSource(videoEl);
+    const highpass = audioCtx.createBiquadFilter(); highpass.type = 'highpass'; highpass.frequency.value = 20;
+    const presence = audioCtx.createBiquadFilter(); presence.type = 'peaking'; presence.frequency.value = 4000; presence.Q.value = 1; presence.gain.value = 0;
+    const compressor = audioCtx.createDynamicsCompressor(); compressor.threshold.value = -100; compressor.ratio.value = 1;
+    const gain = audioCtx.createGain(); gain.gain.value = (+$('volume').value || 100) / 100;
+    source.connect(highpass); highpass.connect(presence); presence.connect(compressor); compressor.connect(gain); gain.connect(audioCtx.destination);
+    videoEl._audioGraph = { highpass, presence, compressor, gain };
+    updateLiveAudio(videoEl);
+  }catch(e){ /* e.g. element already has a source elsewhere — ignore, native audio still plays */ }
+  return videoEl._audioGraph;
+}
+function updateLiveAudio(videoEl){
+  const g = videoEl && videoEl._audioGraph; if(!g) return;
+  if(audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  const enhanceI = +($('enhance') && $('enhance').value || 0);
+  const volumePct = +($('volume') && $('volume').value || 100);
+  g.highpass.frequency.setTargetAtTime(enhanceI > 0.02 ? (60 + 60 * enhanceI) : 20, audioCtx.currentTime, 0.02);
+  g.presence.gain.setTargetAtTime(enhanceI > 0.02 ? (2 + 3 * enhanceI) : 0, audioCtx.currentTime, 0.02);
+  g.compressor.threshold.setTargetAtTime(enhanceI > 0.02 ? -18 : -100, audioCtx.currentTime, 0.02);
+  g.compressor.ratio.setTargetAtTime(enhanceI > 0.02 ? (2 + 2 * enhanceI) : 1, audioCtx.currentTime, 0.02);
+  g.gain.gain.setTargetAtTime(volumePct / 100, audioCtx.currentTime, 0.02);
+}
+function liveAudioTargets(){
+  // Every currently-mounted preview <video> — Clean-tab result and Edit-tab
+  // preview both use class="player", and either/both may be in the DOM.
+  return Array.from(document.querySelectorAll('video.player'));
+}
+function onAudioParamInput(){
+  liveAudioTargets().forEach(v=>{ attachLiveAudio(v); updateLiveAudio(v); });
+  pendingAudioBake = true; // only actually re-render once, lazily, before download/edit
+  if(sid){
+    clearTimeout(audioSaveDebounce);
+    audioSaveDebounce = setTimeout(()=>{
+      fetch('/clean/set_audio_params', {method:'POST', headers:{'content-type':'application/json'},
+        body:JSON.stringify({sid, denoise_intensity:+$('denoise').value, enhance_intensity:+$('enhance').value, volume_pct:+$('volume').value})});
+    }, 400);
+  }
+}
+let audioSaveDebounce = null;
+let pendingAudioBake = false;
+async function ensureAudioBaked(){
+  // Called right before the user actually needs the real file (download or
+  // move to Edit) — this is the one point where the cheap audio-only
+  // reprocess actually runs, instead of on every slider tick.
+  if(!pendingAudioBake || !sid) return;
+  pendingAudioBake = false;
+  await fetch('/clean/bake_audio', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({sid})});
+}
+
 function gatherCleanParams(){
   let sources = clipQueue.length ? clipQueue.slice() : [];
   if(!sources.length){
@@ -1233,25 +2565,37 @@ function gatherCleanParams(){
     if(p && !p.startsWith('(')) sources = [p];
   }
   const params = { sources, src: sources[0]||'', noise_db:+$('noise').value, min_gap:+$('mingap').value, target_gap:+$('target').value,
-    denoise_intensity:+$('denoise').value, enhance_intensity:+$('enhance').value };
-  ['cut_head','cut_tail','remove_retakes','remove_clicks'].forEach(k=>{
+    denoise_intensity:+$('denoise').value, enhance_intensity:+$('enhance').value, volume_pct:+$('volume').value,
+    head_buffer_sec:+$('headbuf').value, tail_buffer_sec:+$('tailbuf').value,
+    camera_movement:$('camera_movement').value };
+  ['cut_head','cut_tail','remove_retakes','remove_clicks','stabilize'].forEach(k=>{
     params[k] = document.querySelector('.toggle[data-key='+k+']').classList.contains('on');
   });
   return params;
 }
+let awaitingApproval = false;
 async function runClean(){
+  if(awaitingApproval && sid){
+    // User has reviewed/corrected the transcript and is ready for the
+    // actual cut+render to happen.
+    $('b-clean').disabled=true; $('b-clean').textContent='Processing...';
+    awaitingApproval = false;
+    await fetch('/clean/approve', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({sid})});
+    pollClean(); return;
+  }
   const params = gatherCleanParams();
   if(!params.sources.length){ alert('Drop at least one video'); return; }
   $('b-clean').disabled=true; $('b-clean').textContent='Processing...';
   if(sid){
-    // re-clean with new knobs (preserve manual_cuts)
+    // re-clean with new knobs (preserve manual_cuts) — transcript's
+    // already been approved once, so this goes straight to analyze/splice.
     await fetch('/clean/reclean', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({sid, ...params})});
     pollClean(); return;
   }
   const r = await fetch('/clean/start', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(params)});
   const j = await r.json();
   if(j.error){ showCleanError(j.error); return; }
-  sid = j.sid; pollClean();
+  setSid(j.sid); pollClean();
   setTimeout(loadWaveform, 800);
   setTimeout(loadTranscript, 1500);
 }
@@ -1303,24 +2647,93 @@ async function loadTranscript(){
     else { span.style.color = '#E9ECED'; }
     span.addEventListener('mouseenter', ()=>{ if(!isCut(w)) span.style.background='rgba(207,255,5,0.15)'; });
     span.addEventListener('mouseleave', ()=>{ if(!isCut(w)) span.style.background=''; });
-    span.addEventListener('click', async ()=>{
-      if(isCut(w)){
-        // find idx of cut covering this word
-        const idx = cuts.findIndex(c => c[0] <= w.start && w.end <= c[1]);
-        await fetch('/transcript/restore', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({sid, idx})});
-      } else {
-        await fetch('/transcript/cut', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({sid, start:w.start - 0.04, end:w.end + 0.04})});
+    // Don't rely on the browser's native 'dblclick' event — its timing
+    // window depends on OS mouse settings and is unreliable on trackpads,
+    // where two deliberate clicks often land further apart than dblclick's
+    // threshold, so it silently never fires and every click just re-runs
+    // the single-click cut/restore toggle instead (exactly what "double-
+    // clicking again and again for the sake of it" looks like). Measuring
+    // the gap between successive 'click' events ourselves, with a longer
+    // 450ms window, is the reliable version of the same idea.
+    let clickTimer = null;
+    let lastClickAt = 0;
+    span.addEventListener('click', ()=>{
+      const now = Date.now();
+      const isDoubleClick = (now - lastClickAt) < 450;
+      lastClickAt = now;
+      if(isDoubleClick){
+        if(clickTimer){ clearTimeout(clickTimer); clickTimer = null; }
+        lastClickAt = 0;
+        openWordEditor();
+        return;
       }
-      loadTranscript();
+      if(clickTimer) clearTimeout(clickTimer);
+      clickTimer = setTimeout(async ()=>{
+        clickTimer = null;
+        if(isCut(w)){
+          const idx = cuts.findIndex(c => c[0] <= w.start && w.end <= c[1]);
+          await fetch('/transcript/restore', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({sid, idx})});
+        } else {
+          await fetch('/transcript/cut', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({sid, word_idx:i})});
+        }
+        loadTranscript();
+      }, 450);
     });
+    function openWordEditor(){
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = w.word;
+      input.style.width = Math.max(50, w.word.length * 9) + 'px';
+      input.style.background = '#1E2434'; input.style.border = '1px solid #CFFF05';
+      input.style.color = '#E9ECED'; input.style.fontSize = '13px';
+      input.style.borderRadius = '3px'; input.style.padding = '1px 4px';
+      span.replaceWith(input);
+      input.focus(); input.select();
+      let saved = false;
+      const save = async ()=>{
+        if(saved) return; saved = true;
+        const val = input.value.trim();
+        if(val && val !== w.word){
+          await fetch('/transcript/edit_word', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({sid, idx:i, text: val})});
+        }
+        loadTranscript();
+      };
+      input.addEventListener('keydown', (ev)=>{
+        if(ev.key === 'Enter'){ input.blur(); }
+        if(ev.key === 'Escape'){ saved = true; loadTranscript(); }
+      });
+      input.addEventListener('blur', save);
+    }
     div.appendChild(span);
   });
   $('tr-cuts').textContent = cuts.length ? `${cuts.length} manual cut(s) — click Clean video to apply` : 'No manual cuts. Click any word above to mark for removal.';
 }
+// Shared /state fetch for all pollers below. A stale sid (server restarted
+// mid-session — SESSIONS is in-memory, wiped on every restart) 404s here;
+// without this guard each poller rendered `j.status` as literal "undefined"
+// AND kept polling forever since none of their done/error checks ever
+// matched, showing "⚡ undefined" on a permanent loop until reload.
+async function fetchState(){
+  const r = await fetch('/state?sid='+sid);
+  const j = await r.json();
+  if(!r.ok || j.error){
+    toast('⚠ Session lost (server restarted) — reload the page');
+    localStorage.removeItem('activeSid');
+    return null;
+  }
+  return j;
+}
 async function pollClean(){
-  const r = await fetch('/state?sid='+sid); const j = await r.json();
+  const j = await fetchState(); if(!j) return;
   renderClean(j);
+  if(j.status==='clean:awaiting_approval'){
+    awaitingApproval = true;
+    $('b-clean').disabled=false; $('b-clean').textContent='Approve transcript & Clean';
+    loadWaveform(); loadTranscript();
+    return; // job_clean has stopped here on purpose — wait for the user
+  }
   if(j.status==='clean:done' || j.status==='clean:error'){
+    awaitingApproval = false;
     $('b-clean').disabled=false; $('b-clean').textContent='Re-clean';
     $('b-undo').disabled = !(j.history && j.history.length > 1);
     if(j.status==='clean:done' && j.clean_path){
@@ -1343,16 +2756,51 @@ function renderClean(j){
       </div>
       <div class="status">Silences: <span class="ok">${j.clean_silences}</span> · Retakes cut: <span class="ok">${j.clean_retakes}</span> · Clicks: <span class="ok">${j.clean_clicks||0}</span> · Manual cuts: <span class="ok">${j.clean_manual||0}</span></div>
       <video class="player" controls src="/file?p=${encodeURIComponent(j.clean_path)}&t=${Date.now()}"></video>
-      <a class="dl" href="/file?p=${encodeURIComponent(j.clean_path)}" download>Download clean.mp4</a>
-      <button class="btn secondary" style="margin-top:10px" onclick="tab('edit')">Continue to Edit →</button></div>`;
+      <button class="dl" style="margin-top:10px" onclick="downloadClean('${j.clean_path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")}')">Download clean.mp4</button>
+      ${(j.stabilize || (j.camera_movement && j.camera_movement !== 'none')) ?
+        `<button class="btn secondary" style="margin-top:10px" onclick="applyCameraEffects()">🎥 Apply Camera Effects (stabilize/movement)</button>` : ''}
+      <button class="btn secondary" style="margin-top:10px" onclick="continueToEdit()">Continue to Edit →</button></div>`;
+    attachLiveAudio(div.querySelector('video.player'));
   } else if(j.status==='clean:error'){
     div.innerHTML = `<div class="card"><div class="status"><span class="err">ERROR</span> ${j.error||''}</div></div>`;
+  } else if(j.status==='clean:awaiting_approval'){
+    div.innerHTML = `<div class="card"><div class="status"><span class="ok">Transcript ready — review it below</span></div>
+      <p style="color:#7a8497;font-size:12px;margin-top:6px">Double-click any wrong word to fix it before the video gets cut. Nothing is rendered yet — click "Approve transcript &amp; Clean" below when it looks right.</p></div>`;
+  } else if(j.status==='clean:combining'){
+    div.innerHTML = `<div class="card"><h2>Combining ${(j.sources||[]).length} clips</h2>${progressBarHtml(j.render_progress)}</div>`;
+  } else if(j.status==='clean:stabilizing'){
+    div.innerHTML = `<div class="card"><h2>Stabilizing</h2>${progressBarHtml(j.render_progress)}</div>`;
+  } else if(j.status==='clean:camera_movement'){
+    div.innerHTML = `<div class="card"><h2>Applying camera movement</h2>${progressBarHtml(j.render_progress)}</div>`;
+  } else if(j.status==='clean:splicing'){
+    div.innerHTML = `<div class="card"><h2>Cutting &amp; splicing</h2>${progressBarHtml(j.render_progress)}</div>`;
   } else {
-    const label = j.status==='clean:combining' ? `⚡ Combining ${(j.sources||[]).length} clips...` : `⚡ ${j.status}`;
+    const label = j.status==='clean:transcribing' ? `⚡ ${j.transcribe_phase || 'Transcribing...'}` : `⚡ ${j.status}`;
     div.innerHTML = `<div class="card"><div class="status"><span class="ok">${label}</span></div></div>`;
   }
 }
 function showCleanError(m){ $('clean-result').classList.remove('hidden'); $('clean-result').innerHTML=`<div class="card"><div class="status"><span class="err">${m}</span></div></div>`; $('b-clean').disabled=false; $('b-clean').textContent='Try again'; }
+async function downloadClean(path){
+  // Volume/enhance only exist live in the browser's Web Audio graph until
+  // now — this is the ONE point (not every slider tick) where they
+  // actually get baked into the real file, right before it's needed.
+  await ensureAudioBaked();
+  const a = document.createElement('a');
+  a.href = '/file?p=' + encodeURIComponent(path) + '&dl=1&t=' + Date.now();
+  document.body.appendChild(a); a.click(); a.remove();
+}
+async function applyCameraEffects(){
+  if(!sid) return;
+  const r = await fetch('/clean/apply_camera_effects', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({sid})});
+  const j = await r.json();
+  if(j.error){ alert(j.error); return; }
+  pollClean();
+}
+
+async function continueToEdit(){
+  await ensureAudioBaked();
+  tab('edit');
+}
 
 async function runEdit(){
   const p = $('edit-path').value.trim(); if(!p){ alert('Need a clean video path'); return; }
@@ -1360,7 +2808,7 @@ async function runEdit(){
   $('b-edit').disabled=true; $('b-edit').textContent='Editing...';
   if(!sid){
     const r = await fetch('/clean/start', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({src:p, cut_head:false, cut_tail:false, remove_retakes:false, noise_db:-32, min_gap:99, target_gap:0.3})});
-    const j = await r.json(); sid = j.sid;
+    const j = await r.json(); setSid(j.sid);
   }
   await fetch('/edit/start', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({sid, src:p})});
   pollEdit();
@@ -1373,7 +2821,16 @@ let currentPlan = []; let selectedIdx = -1; let videoDuration = 30;
 const KIND_COLORS = {
   hook_title:'#CFFF05', word_pop:'#7ad9ff', stat_punch:'#ff9a3c', quote_pull:'#c084fc',
   image_card:'#34d399', tool_logo_burst:'#fbbf24', bar_overlay:'#f472b6', bullet_burst:'#94e0a3',
-  subscribe:'#ef4444', portrait_burst:'#a78bfa', ratio_dots:'#60a5fa'
+  subscribe:'#ef4444', portrait_burst:'#a78bfa', ratio_dots:'#60a5fa',
+  ring_chart:'#e879f9', countdown_reveal:'#facc15', logo_reveal_hero:'#5eead4', logo_reveal_style:'#2dd4bf',
+  image_compare_slider:'#38bdf8', end_card:'#fb7185',
+  gallery_grid:'#818cf8', image_carousel:'#f97316', image_zoom_reveal:'#22d3ee',
+  masonry_gallery:'#c026d3', photo_stack:'#fda4af', picture_in_picture:'#4ade80',
+  polaroid_frame:'#fcd34d', split_panels:'#93c5fd',
+  area_chart:'#84cc16', progress_bars:'#eab308', stat_delta:'#fb923c', comparison_bars:'#f43f5e',
+  circular_progress:'#06b6d4', bounce_title:'#a3e635', bubble_pop_text:'#d946ef', pop_text:'#f472b6',
+  pulse_text:'#8b5cf6', text_sweep:'#facc15', typewriter_text:'#2dd4bf', list_reveal:'#38bdf8',
+  card_flip:'#fbbf24', notification_stack:'#fb7185', carousel_3d:'#4ade80', sound_wave:'#22d3ee'
 };
 
 async function loadPlan(){
@@ -1455,8 +2912,9 @@ function startResize(idx, edge, downEv){
   const tl = $('timeline'); const rect = tl.getBoundingClientRect();
   function move(e){
     const t = pxToSec(e.clientX - rect.left);
-    if(edge==='start') currentPlan[idx].start_sec = +t.toFixed(2);
-    else currentPlan[idx].end_sec = +t.toFixed(2);
+    const MIN_DUR = 0.1;
+    if(edge==='start') currentPlan[idx].start_sec = Math.min(+t.toFixed(2), currentPlan[idx].end_sec - MIN_DUR);
+    else currentPlan[idx].end_sec = Math.max(+t.toFixed(2), currentPlan[idx].start_sec + MIN_DUR);
     renderTimeline();
   }
   function up(){
@@ -1491,7 +2949,8 @@ function beatFields(b){
   const out = [
     {label:'start_sec', html:`<input type="number" step="0.05" data-field="start_sec" value="${b.start_sec}">`},
     {label:'end_sec', html:`<input type="number" step="0.05" data-field="end_sec" value="${b.end_sec}">`},
-    {label:'kind', html:`<select data-field="kind">${['hook_title','word_pop','stat_punch','quote_pull','image_card','tool_logo_burst','bar_overlay','bullet_burst','ratio_dots','subscribe','portrait_burst'].map(k=>`<option ${b.kind===k?'selected':''} value="${k}">${k}</option>`).join('')}</select>`},
+    {label:'kind', html:`<select data-field="kind">${['hook_title','word_pop','stat_punch','quote_pull','image_card','tool_logo_burst','bar_overlay','bullet_burst','ratio_dots','subscribe','portrait_burst','ring_chart','countdown_reveal','logo_reveal_hero','logo_reveal_style','image_compare_slider','end_card','gallery_grid','image_carousel','image_zoom_reveal','masonry_gallery','photo_stack','picture_in_picture','polaroid_frame','split_panels','area_chart','progress_bars','stat_delta','comparison_bars','circular_progress','bounce_title','bubble_pop_text','pop_text','pulse_text','text_sweep','typewriter_text','list_reveal','card_flip','notification_stack','carousel_3d','sound_wave'].map(k=>`<option ${b.kind===k?'selected':''} value="${k}">${k}</option>`).join('')}</select>`},
+    {label:'fx (optional)', html:`<select data-field="fx"><option value="" ${!b.fx?'selected':''}>none</option>${['bokeh_circles','geometric_patterns','gradient_shift','grid_pulse','liquid_wave','matrix_rain','noise_grain','pixel_reveal','starfield','camera_shake','film_burn','ken_burns','letterbox_reveal','parallax_pan','spotlight_reveal','vignette_pulse','whip_pan','zoom_pulse','blinds_in','clock_wipe_in','cross_dissolve_in','fade_through_black_in','iris_in','morph_in','push_in','slide_wipe_in','zoom_through_in'].map(f=>`<option ${b.fx===f?'selected':''} value="${f}">${f}</option>`).join('')}</select>`},
   ];
   if(b.kind==='hook_title'){
     out.push({label:'kicker', html:`<input type="text" data-field="kicker" value="${esc(b.kicker||'')}">`});
@@ -1526,6 +2985,104 @@ function beatFields(b){
     out.push({label:'caption', html:`<input type="text" data-field="caption" value="${esc(b.caption||'')}">`});
   } else if(b.kind==='subscribe'){
     out.push({label:'vertical', html:`<input type="number" step="0.02" data-field="vertical" value="${b.vertical??0.88}">`});
+  } else if(b.kind==='ring_chart'){
+    out.push({label:'title', html:`<input type="text" data-field="title" value="${esc(b.title||'')}">`});
+    out.push({label:'holeRatio', html:`<input type="number" step="0.05" min="0" max="0.85" data-field="holeRatio" value="${b.holeRatio??0.6}">`});
+    out.push({label:'centerValue', html:`<input type="text" data-field="centerValue" value="${esc(b.centerValue||'')}">`});
+    out.push({label:'centerLabel', html:`<input type="text" data-field="centerLabel" value="${esc(b.centerLabel||'')}">`});
+    out.push({label:'segments (JSON)', html:`<textarea data-field="segments">${esc(JSON.stringify(b.segments||[], null, 1))}</textarea>`});
+  } else if(b.kind==='countdown_reveal'){
+    out.push({label:'steps (JSON)', html:`<textarea data-field="steps">${esc(JSON.stringify(b.steps||["3","2","1","GO"], null, 1))}</textarea>`});
+    out.push({label:'subtitle', html:`<input type="text" data-field="subtitle" value="${esc(b.subtitle||'')}">`});
+  } else if(b.kind==='logo_reveal_hero'){
+    out.push({label:'image_path', html:`<input type="text" data-field="image_path" value="${esc(b.image_path||'')}">`});
+    out.push({label:'name', html:`<input type="text" data-field="name" value="${esc(b.name||'')}">`});
+    out.push({label:'tagline', html:`<input type="text" data-field="tagline" value="${esc(b.tagline||'')}">`});
+  } else if(b.kind==='logo_reveal_style'){
+    out.push({label:'image_path', html:`<input type="text" data-field="image_path" value="${esc(b.image_path||'')}">`});
+    out.push({label:'name', html:`<input type="text" data-field="name" value="${esc(b.name||'')}">`});
+    out.push({label:'tagline', html:`<input type="text" data-field="tagline" value="${esc(b.tagline||'')}">`});
+    out.push({label:'style', html:`<select data-field="style">${['blur','bounce','fade','glitch','scale_rotate','split','stroke_draw','typewriter'].map(s=>`<option ${b.style===s?'selected':''} value="${s}">${s}</option>`).join('')}</select>`});
+  } else if(b.kind==='image_compare_slider'){
+    out.push({label:'before_image', html:`<input type="text" data-field="before_image" value="${esc(b.before_image||'')}">`});
+    out.push({label:'after_image', html:`<input type="text" data-field="after_image" value="${esc(b.after_image||'')}">`});
+    out.push({label:'before_label', html:`<input type="text" data-field="before_label" value="${esc(b.before_label||'')}">`});
+    out.push({label:'after_label', html:`<input type="text" data-field="after_label" value="${esc(b.after_label||'')}">`});
+  } else if(b.kind==='end_card'){
+    out.push({label:'title', html:`<input type="text" data-field="title" value="${esc(b.title||'')}">`});
+    out.push({label:'subtitle', html:`<input type="text" data-field="subtitle" value="${esc(b.subtitle||'')}">`});
+    out.push({label:'cta', html:`<input type="text" data-field="cta" value="${esc(b.cta||'')}">`});
+  } else if(b.kind==='gallery_grid' || b.kind==='masonry_gallery'){
+    out.push({label:'images (JSON)', html:`<textarea data-field="images">${esc(JSON.stringify(b.images||[], null, 1))}</textarea>`});
+    out.push({label:'caption', html:`<input type="text" data-field="caption" value="${esc(b.caption||'')}">`});
+  } else if(b.kind==='image_carousel'){
+    out.push({label:'images (JSON)', html:`<textarea data-field="images">${esc(JSON.stringify(b.images||[], null, 1))}</textarea>`});
+    out.push({label:'labels (JSON)', html:`<textarea data-field="labels">${esc(JSON.stringify(b.labels||[], null, 1))}</textarea>`});
+    out.push({label:'slot_sec', html:`<input type="number" step="0.1" data-field="slot_sec" value="${b.slot_sec??1.4}">`});
+  } else if(b.kind==='image_zoom_reveal' || b.kind==='polaroid_frame'){
+    out.push({label:'image', html:`<input type="text" data-field="image" value="${esc(b.image||'')}">`});
+    out.push({label:'caption', html:`<input type="text" data-field="caption" value="${esc(b.caption||'')}">`});
+  } else if(b.kind==='photo_stack'){
+    out.push({label:'images (JSON)', html:`<textarea data-field="images">${esc(JSON.stringify(b.images||[], null, 1))}</textarea>`});
+    out.push({label:'captions (JSON)', html:`<textarea data-field="captions">${esc(JSON.stringify(b.captions||[], null, 1))}</textarea>`});
+  } else if(b.kind==='picture_in_picture'){
+    out.push({label:'main_image', html:`<input type="text" data-field="main_image" value="${esc(b.main_image||'')}">`});
+    out.push({label:'pip_image', html:`<input type="text" data-field="pip_image" value="${esc(b.pip_image||'')}">`});
+    out.push({label:'pip_label', html:`<input type="text" data-field="pip_label" value="${esc(b.pip_label||'')}">`});
+  } else if(b.kind==='split_panels'){
+    out.push({label:'left_image', html:`<input type="text" data-field="left_image" value="${esc(b.left_image||'')}">`});
+    out.push({label:'right_image', html:`<input type="text" data-field="right_image" value="${esc(b.right_image||'')}">`});
+    out.push({label:'left_label', html:`<input type="text" data-field="left_label" value="${esc(b.left_label||'')}">`});
+    out.push({label:'right_label', html:`<input type="text" data-field="right_label" value="${esc(b.right_label||'')}">`});
+  } else if(b.kind==='area_chart'){
+    out.push({label:'title', html:`<input type="text" data-field="title" value="${esc(b.title||'')}">`});
+    out.push({label:'caption', html:`<input type="text" data-field="caption" value="${esc(b.caption||'')}">`});
+    out.push({label:'chart_points (JSON)', html:`<textarea data-field="chart_points">${esc(JSON.stringify(b.chart_points||[], null, 1))}</textarea>`});
+  } else if(b.kind==='progress_bars'){
+    out.push({label:'title', html:`<input type="text" data-field="title" value="${esc(b.title||'')}">`});
+    out.push({label:'bars (JSON)', html:`<textarea data-field="bars">${esc(JSON.stringify(b.bars||[], null, 1))}</textarea>`});
+  } else if(b.kind==='stat_delta'){
+    out.push({label:'pre_label', html:`<input type="text" data-field="pre_label" value="${esc(b.pre_label||'')}">`});
+    out.push({label:'prefix', html:`<input type="text" data-field="prefix" value="${esc(b.prefix||'')}">`});
+    out.push({label:'target', html:`<input type="number" data-field="target" value="${b.target??0}">`});
+    out.push({label:'suffix', html:`<input type="text" data-field="suffix" value="${esc(b.suffix||'')}">`});
+    out.push({label:'delta_value', html:`<input type="text" data-field="delta_value" value="${esc(b.delta_value||'')}">`});
+    out.push({label:'delta_direction', html:`<select data-field="delta_direction"><option ${b.delta_direction==='up'?'selected':''} value="up">up</option><option ${b.delta_direction==='down'?'selected':''} value="down">down</option></select>`});
+    out.push({label:'delta_label', html:`<input type="text" data-field="delta_label" value="${esc(b.delta_label||'')}">`});
+  } else if(b.kind==='comparison_bars'){
+    out.push({label:'title', html:`<input type="text" data-field="title" value="${esc(b.title||'')}">`});
+    out.push({label:'before_label', html:`<input type="text" data-field="before_label" value="${esc(b.before_label||'')}">`});
+    out.push({label:'after_label', html:`<input type="text" data-field="after_label" value="${esc(b.after_label||'')}">`});
+    out.push({label:'comparison_rows (JSON)', html:`<textarea data-field="comparison_rows">${esc(JSON.stringify(b.comparison_rows||[], null, 1))}</textarea>`});
+  } else if(b.kind==='circular_progress'){
+    out.push({label:'value_pct', html:`<input type="number" min="0" max="100" data-field="value_pct" value="${b.value_pct??0}">`});
+    out.push({label:'title', html:`<input type="text" data-field="title" value="${esc(b.title||'')}">`});
+    out.push({label:'caption', html:`<input type="text" data-field="caption" value="${esc(b.caption||'')}">`});
+  } else if(b.kind==='bounce_title'){
+    out.push({label:'title', html:`<input type="text" data-field="title" value="${esc(b.title||'')}">`});
+    out.push({label:'subtitle', html:`<input type="text" data-field="subtitle" value="${esc(b.subtitle||'')}">`});
+  } else if(b.kind==='bubble_pop_text' || b.kind==='pop_text' || b.kind==='pulse_text' || b.kind==='text_sweep'){
+    out.push({label:'quote_text', html:`<textarea data-field="quote_text">${esc(b.quote_text||'')}</textarea>`});
+  } else if(b.kind==='typewriter_text'){
+    out.push({label:'quote_text', html:`<textarea data-field="quote_text">${esc(b.quote_text||'')}</textarea>`});
+    out.push({label:'chars_per_second', html:`<input type="number" data-field="chars_per_second" value="${b.chars_per_second??12}">`});
+  } else if(b.kind==='list_reveal'){
+    out.push({label:'title', html:`<input type="text" data-field="title" value="${esc(b.title||'')}">`});
+    out.push({label:'items (JSON)', html:`<textarea data-field="items">${esc(JSON.stringify(b.items||[], null, 1))}</textarea>`});
+  } else if(b.kind==='card_flip'){
+    out.push({label:'front_text', html:`<input type="text" data-field="front_text" value="${esc(b.front_text||'')}">`});
+    out.push({label:'back_text', html:`<input type="text" data-field="back_text" value="${esc(b.back_text||'')}">`});
+    out.push({label:'front_label', html:`<input type="text" data-field="front_label" value="${esc(b.front_label||'')}">`});
+    out.push({label:'back_label', html:`<input type="text" data-field="back_label" value="${esc(b.back_label||'')}">`});
+    out.push({label:'flip_sec', html:`<input type="number" step="0.1" data-field="flip_sec" value="${b.flip_sec??1.5}">`});
+  } else if(b.kind==='notification_stack'){
+    out.push({label:'notifications (JSON)', html:`<textarea data-field="notifications">${esc(JSON.stringify(b.notifications||[], null, 1))}</textarea>`});
+  } else if(b.kind==='carousel_3d'){
+    out.push({label:'title', html:`<input type="text" data-field="title" value="${esc(b.title||'')}">`});
+    out.push({label:'carousel_items (JSON)', html:`<textarea data-field="carousel_items">${esc(JSON.stringify(b.carousel_items||[], null, 1))}</textarea>`});
+  } else if(b.kind==='sound_wave'){
+    out.push({label:'caption', html:`<input type="text" data-field="caption" value="${esc(b.caption||'')}">`});
+    out.push({label:'bar_count', html:`<input type="number" data-field="bar_count" value="${b.bar_count??24}">`});
   }
   return out;
 }
@@ -1533,8 +3090,8 @@ function beatFields(b){
 async function updateField(field, value){
   if(selectedIdx<0) return;
   let v = value;
-  if(field==='start_sec' || field==='end_sec' || field==='vertical' || field==='card_top' || field==='total' || field==='marked') v = +value;
-  if(field==='items' || field==='bars'){
+  if(field==='start_sec' || field==='end_sec' || field==='vertical' || field==='card_top' || field==='total' || field==='marked' || field==='holeRatio' || field==='value_pct' || field==='target' || field==='chars_per_second' || field==='flip_sec' || field==='bar_count') v = +value;
+  if(field==='items' || field==='bars' || field==='segments' || field==='steps' || field==='images' || field==='labels' || field==='captions' || field==='chart_points' || field==='comparison_rows' || field==='notifications' || field==='carousel_items'){
     try{ v = JSON.parse(value); } catch(e){ return; }
   }
   currentPlan[selectedIdx][field] = v;
@@ -1646,7 +3203,7 @@ async function loadMusic(){
   });
 }
 async function pollEdit(){
-  const r = await fetch('/state?sid='+sid); const j = await r.json();
+  const j = await fetchState(); if(!j) return;
   renderEdit(j);
   if(j.chat) renderChat(j.chat);
   if(j.status==='edit:done' || j.status==='edit:error'){
@@ -1656,13 +3213,51 @@ async function pollEdit(){
   }
   setTimeout(pollEdit, 1500);
 }
+function progressBarHtml(p){
+  if(!p || !p.total){
+    return `<div class="status"><span class="ok">⚡ starting render…</span></div>`;
+  }
+  const pct = Math.min(100, Math.round((p.current / p.total) * 100));
+  const phaseLabel = p.phase === 'encoding' ? 'Encoding' : p.phase === 'rendering' ? 'Rendering frames' : p.phase;
+  const eta = p.eta_sec != null ? ` · ~${p.eta_sec}s left` : '';
+  return `
+    <div class="status" style="padding:0;background:transparent">
+      <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-bottom:6px">
+        <span>${phaseLabel} — ${p.current}/${p.total}</span>
+        <span>${pct}%${eta}</span>
+      </div>
+      <div style="height:8px;background:var(--input-bg);border-radius:4px;overflow:hidden;border:1px solid var(--input-border)">
+        <div style="height:100%;width:${pct}%;background:var(--accent);transition:width .3s ease"></div>
+      </div>
+    </div>`;
+}
+let lastPreviewScrolledFor = null;
 function renderEdit(j){
   const div = $('edit-result');
+  if(j.status==='edit:planning'){
+    div.classList.remove('hidden');
+    div.innerHTML = `<div class="card"><h2>Planning</h2><div class="status"><span class="ok">⚡ ${j.transcribe_phase || 'Transcribing...'}</span></div></div>`;
+    return;
+  }
+  if(j.status==='edit:rendering'){
+    div.classList.remove('hidden');
+    div.innerHTML = `<div class="card"><h2>Rendering</h2>${progressBarHtml(j.render_progress)}</div>`;
+    return;
+  }
   if(j.status==='edit:done' && j.preview_path){
     div.classList.remove('hidden');
     div.innerHTML = `<div class="card"><h2>Preview</h2>
       <video class="player" controls src="/file?p=${encodeURIComponent(j.preview_path)}&t=${Date.now()}"></video>
     </div>`;
+    attachLiveAudio(div.querySelector('video.player'));
+    // Scroll the finished preview into view automatically instead of
+    // leaving the user staring at wherever the page happened to be
+    // scrolled — only once per preview (not on every poll tick), keyed
+    // on the path so a genuinely new preview scrolls again.
+    if(lastPreviewScrolledFor !== j.preview_path){
+      lastPreviewScrolledFor = j.preview_path;
+      setTimeout(()=>{ div.scrollIntoView({behavior:'smooth', block:'start'}); }, 50);
+    }
   }
 }
 function renderChat(chat){
@@ -1686,10 +3281,16 @@ async function setAspect(){
   await fetch('/aspect', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({sid, aspect})});
 }
 async function openTools(){
-  await fetch('/tools/studio', {method:'POST'});
-  await fetch('/tools/tuner', {method:'POST'});
-  window.open('http://localhost:3001','_blank');
-  setTimeout(()=>window.open('http://localhost:5050','_blank'), 500);
+  const [rs, rt] = await Promise.all([
+    fetch('/tools/studio', {method:'POST'}).then(r=>r.json()).catch(()=>({ok:false})),
+    fetch('/tools/tuner', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({sid})}).then(r=>r.json()).catch(()=>({ok:false})),
+  ]);
+  if(!rs.ok) toast('⚠ Could not start Remotion Studio — check ⚠ error log');
+  if(!rt.ok) toast('⚠ Could not start Position Tuner — check ⚠ error log');
+  // tuner (plain Flask) boots almost instantly; Remotion Studio runs a webpack
+  // build first, so give it real time to actually bind before opening its tab.
+  if(rt.ok) window.open('http://localhost:5058','_blank');
+  if(rs.ok) setTimeout(()=>window.open('http://localhost:5057','_blank'), 3500);
 }
 
 async function runFinal(){
@@ -1700,12 +3301,12 @@ async function runFinal(){
   pollFinal();
 }
 async function pollFinal(){
-  const r = await fetch('/state?sid='+sid); const j = await r.json();
+  const j = await fetchState(); if(!j) return;
   const div=$('export-result'); div.classList.remove('hidden');
   if(j.status==='export:done' && j.final_path){
     div.innerHTML = `<div class="card"><h2>🎬 Final ready</h2>
       <video class="player" controls src="/file?p=${encodeURIComponent(j.final_path)}&t=${Date.now()}"></video>
-      <a class="dl" href="/file?p=${encodeURIComponent(j.final_path)}" download>Download final .mp4</a></div>`;
+      <a class="dl" href="/file?p=${encodeURIComponent(j.final_path)}&dl=1" download>Download final .mp4</a></div>`;
     $('b-final').disabled=false; $('b-final').textContent='Re-render';
     return;
   }
@@ -1714,8 +3315,8 @@ async function pollFinal(){
     $('b-final').disabled=false; $('b-final').textContent='Try again';
     return;
   }
-  div.innerHTML = `<div class="card"><div class="status"><span class="ok">⚡ ${j.status}</span></div></div>`;
-  setTimeout(pollFinal, 2000);
+  div.innerHTML = `<div class="card"><h2>Rendering final</h2>${progressBarHtml(j.render_progress)}</div>`;
+  setTimeout(pollFinal, 1000);
 }
 </script></body></html>"""
 
@@ -1728,6 +3329,16 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        # Every poller (pollClean/pollEdit/pollFinal/fetchState) hits the
+        # EXACT SAME URL (/state?sid=X) repeatedly with no cache-busting --
+        # without this header nothing stops the browser from silently
+        # serving a stale cached response instead of asking the server.
+        # Confirmed directly: a real browser test showed a progress bar
+        # frozen mid-render (network tab still showing requests "succeeding")
+        # while the server had already finished and moved on -- this is very
+        # likely the actual mechanism behind every "looks frozen" report,
+        # not just the missing-progress-data bugs fixed elsewhere.
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -1828,17 +3439,55 @@ class H(BaseHTTPRequestHandler):
             return
 
         if u.path == "/file":
-            p = Path(parse_qs(u.query).get("p", [""])[0])
+            q = parse_qs(u.query)
+            p = Path(q.get("p", [""])[0])
             if not p.exists(): self.send_response(404); self.end_headers(); return
+            size = p.stat().st_size
+            is_download = q.get("dl", ["0"])[0] == "1"
+            # <video> elements normally issue HTTP Range requests to stream/
+            # seek instead of pulling the whole file up front — without
+            # Range support the browser may be forced into a full-buffer
+            # load before any playback starts, which on a large clean.mp4
+            # (100+ MB) can look and behave just like an unwanted automatic
+            # download even though no download was actually triggered.
+            range_header = self.headers.get("Range")
+            if range_header and not is_download:
+                try:
+                    range_val = range_header.split("=", 1)[1]
+                    start_s, end_s = range_val.split("-", 1)
+                    start = int(start_s)
+                    end = int(end_s) if end_s else size - 1
+                    end = min(end, size - 1)
+                    self.send_response(206)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Length", str(end - start + 1))
+                    self.end_headers()
+                    with p.open("rb") as f:
+                        f.seek(start)
+                        remaining = end - start + 1
+                        while remaining > 0:
+                            chunk = f.read(min(65536, remaining))
+                            if not chunk: break
+                            self.wfile.write(chunk)
+                            remaining -= len(chunk)
+                    return
+                except Exception:
+                    pass  # fall through to a plain full-file response below
             self.send_response(200)
             self.send_header("Content-Type", "video/mp4")
-            self.send_header("Content-Length", str(p.stat().st_size))
-            # Header values are latin-1 only; macOS time-stamped names carry
-            # U+202F (narrow no-break space). Give an ASCII fallback + RFC 5987
-            # UTF-8 name so browsers still get the real filename.
-            ascii_name = p.name.encode("ascii", "ignore").decode("ascii") or "download"
-            self.send_header("Content-Disposition",
-                             f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(p.name)}")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Accept-Ranges", "bytes")
+            # only force download when explicitly asked (dl=1) — the <video> player
+            # needs this endpoint to serve inline, not as an attachment
+            if is_download:
+                # Header values are latin-1 only; macOS time-stamped names carry
+                # U+202F (narrow no-break space). Give an ASCII fallback + RFC 5987
+                # UTF-8 name so browsers still get the real filename.
+                ascii_name = p.name.encode("ascii", "ignore").decode("ascii") or "download"
+                self.send_header("Content-Disposition",
+                                 f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(p.name)}")
             self.end_headers()
             with p.open("rb") as f: shutil.copyfileobj(f, self.wfile)
             return
@@ -1865,18 +3514,42 @@ class H(BaseHTTPRequestHandler):
             if not resolved: self._json(400, {"error": "no sources"}); return
             src = Path(resolved[0])
             sid = uuid.uuid4().hex
+            # This is the FIRST clean for a brand-new session — the client
+            # ALWAYS sends explicit noise_db/min_gap values (the sliders'
+            # current DOM value, never absent), but for a video the user
+            # hasn't seen a waveform for yet, those are just untouched
+            # defaults, not an informed choice. Calibrate both to the
+            # actual recording instead of trusting one fixed pair for every
+            # upload. 0.3s min_gap was verified directly to be too
+            # conservative for real conversational speech: on a real test
+            # recording it found 4 pause-gaps vs. 20 at 0.1s for the exact
+            # same audio — most real pauses in fast/natural speech are
+            # under 0.3s and were being missed entirely. Subsequent
+            # /clean/reclean calls respect the user's explicit knob choice.
+            try:
+                total_dur0 = probe_duration(src)
+                calibrated_min_gap = 0.12
+                calibrated_noise_db = auto_noise_db(src, calibrated_min_gap, total_dur0)
+            except Exception:
+                calibrated_min_gap = body.get("min_gap", 0.30)
+                calibrated_noise_db = body.get("noise_db", -32)
             SESSIONS[sid] = {
                 "src": str(src.resolve()),
                 "sources": resolved,
-                "noise_db": body.get("noise_db", -32),
-                "min_gap": body.get("min_gap", 0.30),
+                "noise_db": calibrated_noise_db,
+                "min_gap": calibrated_min_gap,
                 "target_gap": body.get("target_gap", 0.30),
                 "cut_head": body.get("cut_head", True),
                 "cut_tail": body.get("cut_tail", True),
+                "head_buffer_sec": body.get("head_buffer_sec", 0.5),
+                "tail_buffer_sec": body.get("tail_buffer_sec", 0.5),
                 "remove_retakes": body.get("remove_retakes", True),
                 "remove_clicks": body.get("remove_clicks", False),
+                "stabilize": body.get("stabilize", False),
+                "camera_movement": body.get("camera_movement", "none"),
                 "denoise_intensity": body.get("denoise_intensity", 0.0),
                 "enhance_intensity": body.get("enhance_intensity", 0.0),
+                "volume_pct": body.get("volume_pct", 100.0),
                 "manual_cuts": body.get("manual_cuts", []),
                 "status": "clean:queued", "chat": [], "history": [],
             }
@@ -1887,13 +3560,108 @@ class H(BaseHTTPRequestHandler):
             sid = body.get("sid")
             if sid not in SESSIONS: self._json(404, {"error": "no session"}); return
             sess = SESSIONS[sid]
-            # update knobs from body
-            for k in ("noise_db", "min_gap", "target_gap", "cut_head", "cut_tail",
-                      "remove_retakes", "remove_clicks", "denoise_intensity", "enhance_intensity"):
+            CUT_AFFECTING_KEYS = ("noise_db", "min_gap", "target_gap", "cut_head", "cut_tail",
+                                   "head_buffer_sec", "tail_buffer_sec",
+                                   "remove_retakes", "remove_clicks")
+            # stabilize/camera_movement no longer run as part of Clean/Re-clean
+            # at all -- they're a separate, explicit "Apply Camera Effects" step
+            # (POST /clean/apply_camera_effects) the user triggers on the
+            # already-cleaned video, once, only if they actually want it. So
+            # changing these settings here just updates the saved toggle value
+            # for that later step -- it must NOT force a full re-splice (the
+            # base cut is completely unaffected by them now).
+            SAVED_ONLY_KEYS = ("stabilize", "camera_movement", "camera_movement_intensity")
+            # Adjusting ONLY denoise/enhance doesn't change which video
+            # segments survive the cut at all — re-running the full
+            # silence/retake analysis + re-encoding the entire video for a
+            # pure audio-processing tweak is expensive and unnecessary.
+            # Detect that case and take the cheap path: re-apply just the
+            # audio filter to the ALREADY-SPLICED clean.mp4 with the video
+            # stream copied (not re-encoded) instead of redoing everything.
+            cut_params_changed = any(
+                k in body and body[k] != sess.get(k) for k in CUT_AFFECTING_KEYS
+            )
+            manual_cuts_changed = "manual_cuts" in body and body["manual_cuts"] != sess.get("manual_cuts")
+            audio_only = (
+                not cut_params_changed and not manual_cuts_changed
+                and sess.get("clean_path") and Path(sess["clean_path"]).exists()
+                and ("denoise_intensity" in body or "enhance_intensity" in body or "volume_pct" in body)
+            )
+            for k in CUT_AFFECTING_KEYS + SAVED_ONLY_KEYS + ("denoise_intensity", "enhance_intensity", "volume_pct"):
                 if k in body: sess[k] = body[k]
             if "manual_cuts" in body: sess["manual_cuts"] = body["manual_cuts"]
-            threading.Thread(target=job_clean, args=(sid,), daemon=True).start()
+            if audio_only:
+                threading.Thread(target=job_audio_only_finish, args=(sid,), daemon=True).start()
+            else:
+                # Re-clean (adjusting knobs after the transcript's already been
+                # approved once) goes straight to the analyze/splice stage — the
+                # transcript itself doesn't need re-transcribing or re-approving
+                # just because a silence/retake knob changed.
+                threading.Thread(target=job_clean_finish, args=(sid,), daemon=True).start()
+            self._json(200, {"ok": True, "audio_only": audio_only}); return
+
+        if u.path == "/clean/apply_camera_effects":
+            # Explicit, separate action -- stabilize/camera_movement run
+            # here and ONLY here, on the already-cleaned base video, never
+            # automatically as part of /clean/start or /clean/reclean.
+            sid = body.get("sid")
+            if sid not in SESSIONS: self._json(404, {"error": "no session"}); return
+            sess = SESSIONS[sid]
+            if sess.get("status") != "clean:done":
+                self._json(400, {"error": "clean the video first"}); return
+            if "stabilize" in body: sess["stabilize"] = body["stabilize"]
+            if "camera_movement" in body: sess["camera_movement"] = body["camera_movement"]
+            if "camera_movement_intensity" in body: sess["camera_movement_intensity"] = body["camera_movement_intensity"]
+            threading.Thread(target=job_apply_camera_effects, args=(sid,), daemon=True).start()
             self._json(200, {"ok": True}); return
+
+        if u.path == "/clean/approve":
+            # First transition out of "awaiting_approval" — the user has
+            # reviewed (and possibly corrected via double-click) the
+            # transcript and is ready for the actual cut/render to happen.
+            sid = body.get("sid")
+            if sid not in SESSIONS: self._json(404, {"error": "no session"}); return
+            sess = SESSIONS[sid]
+            if sess.get("status") != "clean:awaiting_approval":
+                self._json(400, {"error": "not awaiting approval"}); return
+            threading.Thread(target=job_clean_finish, args=(sid,), daemon=True).start()
+            self._json(200, {"ok": True}); return
+
+        if u.path == "/clean/set_audio_params":
+            # Just persists the numbers — no render, no ffmpeg call. Volume
+            # and enhance are already live in the browser's own Web Audio
+            # graph; this only needs to remember the values so bake_audio
+            # (called once, lazily, right before download/edit) uses them.
+            sid = body.get("sid")
+            sess = SESSIONS.get(sid)
+            if not sess: self._json(404, {"error": "no session"}); return
+            for k in ("denoise_intensity", "enhance_intensity", "volume_pct"):
+                if k in body: sess[k] = body[k]
+            self._json(200, {"ok": True}); return
+
+        if u.path == "/clean/bake_audio":
+            # The one point audio params actually get encoded into the real
+            # file — called right before the user needs it (download button,
+            # or moving to Edit), not on every slider tick. Synchronous
+            # (blocks until done) since the client awaits this before
+            # triggering the download / tab switch.
+            sid = body.get("sid")
+            sess = SESSIONS.get(sid)
+            if not sess: self._json(404, {"error": "no session"}); return
+            clean_path = sess.get("clean_path")
+            if not clean_path or not Path(clean_path).exists():
+                self._json(200, {"ok": True, "skipped": "no clean_path yet"}); return
+            raw = Path(str(clean_path) + ".raw.mp4")
+            if not raw.exists():
+                self._json(200, {"ok": True, "skipped": "no raw intermediate"}); return
+            try:
+                audio_filter = build_audio_chain(
+                    sess.get("denoise_intensity", 0), sess.get("enhance_intensity", 0),
+                    noise_floor_db=sess.get("noise_db"), volume_pct=sess.get("volume_pct", 100.0))
+                apply_audio_filter(raw, Path(clean_path), audio_filter)
+                self._json(200, {"ok": True}); return
+            except Exception as e:
+                self._json(500, {"error": str(e)}); return
 
         if u.path == "/clean/undo":
             sid = body.get("sid")
@@ -1903,16 +3671,30 @@ class H(BaseHTTPRequestHandler):
             sess["history"].pop()  # drop current
             prev = sess["history"][-1]
             for k, v in prev.items(): sess[k] = v
-            threading.Thread(target=job_clean, args=(sid,), daemon=True).start()
+            # Undo re-applies a previous knob configuration — the transcript
+            # was already approved earlier in this session, so this goes
+            # straight to analyze/splice like reclean does.
+            threading.Thread(target=job_clean_finish, args=(sid,), daemon=True).start()
             self._json(200, {"ok": True}); return
 
         if u.path == "/transcript/cut":
             sid = body.get("sid")
             sess = SESSIONS.get(sid)
             if not sess: self._json(404, {"error": "no session"}); return
-            # body: {"start": float, "end": float}
+            words = sess.get("words", [])
+            if "word_idx" in body:
+                # Padding computed server-side, clamped to the actual gap
+                # to the neighboring word — see pad_span_safe(). A blind
+                # client-computed +/-0.04s (the old behavior) routinely bit
+                # into the next word in fast speech, truncating it.
+                idx = body["word_idx"]
+                if not (0 <= idx < len(words)):
+                    self._json(400, {"error": "bad word_idx"}); return
+                start, end = pad_span_safe(words, idx, idx, 0.04)
+            else:
+                start, end = body["start"], body["end"]
             mc = sess.setdefault("manual_cuts", [])
-            mc.append([body["start"], body["end"]])
+            mc.append([start, end])
             self._json(200, {"manual_cuts": mc}); return
 
         if u.path == "/transcript/restore":
@@ -1923,6 +3705,33 @@ class H(BaseHTTPRequestHandler):
             mc = sess.get("manual_cuts", [])
             if 0 <= idx < len(mc): mc.pop(idx)
             self._json(200, {"manual_cuts": mc}); return
+
+        if u.path == "/transcript/edit_word":
+            # Corrects a misheard/wrong word's TEXT in place (start/end
+            # timestamps untouched — the ASR alignment timing is still
+            # right even when the word itself was misheard). Persisted to
+            # the on-disk words.json in the workdir, not just in-memory, so
+            # every downstream consumer that reads the transcript later
+            # (captions_plan generation, retake detection, re-editing) sees
+            # the correction — fixing it once here, not once per feature.
+            sid = body.get("sid")
+            sess = SESSIONS.get(sid)
+            if not sess: self._json(404, {"error": "no session"}); return
+            idx = body.get("idx", -1)
+            new_text = str(body.get("text", "")).strip()
+            words = sess.get("words", [])
+            if not new_text or not (0 <= idx < len(words)):
+                self._json(400, {"error": "bad index or empty text"}); return
+            words[idx]["word"] = new_text
+            sess["words"] = words
+            wd = sess.get("workdir")
+            if wd:
+                wp = Path(wd) / "words.json"
+                try:
+                    wp.write_text(json.dumps(words, indent=2, ensure_ascii=True), encoding="ascii")
+                except Exception:
+                    pass
+            self._json(200, {"words": words}); return
 
         if u.path == "/edit/start":
             sid = body.get("sid")
@@ -1963,9 +3772,11 @@ class H(BaseHTTPRequestHandler):
             self._json(200, {"ok": True}); return
 
         if u.path == "/tools/studio":
-            launch_studio(); self._json(200, {"ok": True}); return
+            ok = launch_studio(); self._json(200, {"ok": ok}); return
         if u.path == "/tools/tuner":
-            launch_tuner(); self._json(200, {"ok": True}); return
+            sess = SESSIONS.get(body.get("sid"))
+            wd = str(edit_workdir_for(sess)) if sess else None
+            ok = launch_tuner(wd); self._json(200, {"ok": ok}); return
 
         # ───── Plan editor endpoints ─────
         if u.path == "/plan/update":
@@ -2020,8 +3831,11 @@ class H(BaseHTTPRequestHandler):
             edge = body.get("edge", "end"); new_t = float(body.get("t", 0))
             plan = load_plan(sid)
             if 0 <= idx < len(plan):
-                if edge == "start": plan[idx]["start_sec"] = round(new_t, 2)
-                else: plan[idx]["end_sec"] = round(new_t, 2)
+                MIN_DUR = 0.1
+                if edge == "start":
+                    plan[idx]["start_sec"] = round(min(new_t, plan[idx].get("end_sec", 0) - MIN_DUR), 2)
+                else:
+                    plan[idx]["end_sec"] = round(max(new_t, plan[idx].get("start_sec", 0) + MIN_DUR), 2)
                 save_plan(sid, plan)
             self._json(200, {"plan": plan}); return
 
@@ -2091,6 +3905,10 @@ class H(BaseHTTPRequestHandler):
             new_sid = load_project(Path(path))
             self._json(200 if new_sid else 404, {"sid": new_sid} if new_sid else {"error": "load failed"}); return
 
+        if u.path == "/project/delete":
+            ok = delete_project(Path(body.get("path", "")))
+            self._json(200, {"ok": ok}); return
+
         if u.path == "/asset/upload":
             # multipart upload handled inline (basic parser)
             sid = parse_qs(urlparse(self.path).query).get("sid", [""])[0]
@@ -2098,9 +3916,13 @@ class H(BaseHTTPRequestHandler):
             if not sess: self._json(404, {"error": "no session"}); return
             # only support simple raw-body upload w/ filename header
             fname = self.headers.get("X-Filename", f"upload_{int(time.time())}.bin")
-            wd = Path(sess.get("edit_workdir") or sess.get("workdir") or "")
-            broll = wd / "broll"; broll.mkdir(parents=True, exist_ok=True)
+            if Path(fname).suffix.lower() not in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+                self._json(400, {"error": "unsupported image type"}); return
             n = int(self.headers.get("Content-Length", 0))
+            if n <= 0:
+                self._json(400, {"error": "empty upload"}); return
+            wd = edit_workdir_for(sess)
+            broll = wd / "broll"; broll.mkdir(parents=True, exist_ok=True)
             (broll / fname).write_bytes(self.rfile.read(n))
             self._json(200, {"image_path": f"broll/{fname}"}); return
 
@@ -2110,4 +3932,11 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     port = int(os.getenv("STUDIO_PORT", "5056"))  # 5000 is taken by macOS AirPlay Receiver
     print(f"Video Studio: http://localhost:{port}")
-    HTTPServer(("localhost", port), H).serve_forever()
+    # ThreadingHTTPServer, not plain HTTPServer — the plain single-threaded
+    # server processes one request at a time. A render's status polling
+    # (/state every 1.5s from the browser) would queue up behind it and the
+    # server could stop accepting new connections entirely under load —
+    # exactly why progress polling appeared to freeze during a render.
+    server = ThreadingHTTPServer(("localhost", port), H)
+    server.daemon_threads = True
+    server.serve_forever()

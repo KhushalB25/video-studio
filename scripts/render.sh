@@ -11,6 +11,13 @@
 #   broll/<n>.png     (Higgsfield-generated b-roll images)
 set -euo pipefail
 
+# On Windows, Python's default stdout/stderr encoding follows the console
+# codepage (cp1252), not UTF-8. Every helper script below prints unicode
+# (→, ✓, emoji, etc in status lines) — without this, any of them can crash
+# with UnicodeEncodeError the moment they print a character cp1252 can't
+# represent, aborting the whole render. Force UTF-8 for all of them.
+export PYTHONIOENCODING=utf-8
+
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REMOTION_DIR="$SKILL_DIR/remotion"
 
@@ -58,13 +65,22 @@ fi
 VIDEO_PATH="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 VARIANT="${2:-}"
 
-WORKDIR=$(python3 -c "
+# Bash's path resolution (cd/pwd) normalizes $1 differently than Python's
+# Path.resolve() — same file, different string, different sha1, wrong dir.
+# Callers that already KNOW the workdir (e.g. studio.py, which computed it
+# in Python before ever invoking this script) should pass it explicitly via
+# STUDIO_WORKDIR so no hash has to match across languages at all.
+if [ -n "${STUDIO_WORKDIR:-}" ]; then
+  WORKDIR=$(printf '%s' "$STUDIO_WORKDIR" | tr '\\' '/')
+else
+  WORKDIR=$(python3 -c "
 import hashlib
 from pathlib import Path
 p = Path('$VIDEO_PATH').resolve()
 digest = hashlib.sha1(str(p).encode()).hexdigest()[:12]
 print(str(Path.home() / '.cache' / 'video-edit' / f'{p.stem[:40]}_{digest}').replace('\\\\', '/'))
 ")
+fi
 
 PLAN_DIR="$WORKDIR${VARIANT:+/$VARIANT}"
 mkdir -p "$PLAN_DIR"
@@ -86,13 +102,19 @@ fi
 # leak across renders. End-of-render also restores so the next render's
 # diff check doesn't see mutation residue as "user-edited".
 SRC_PLAN="$PLAN_DIR/broll_plan.source.json"
+# Plain `cp` truncates the destination before copying — under a concurrent
+# render (or even a slow disk) that leaves a 0-byte window a reader can hit.
+# `cp X Y.tmp && mv Y.tmp Y` is atomic: Y is always either the old content or
+# the new content, never empty. This was the last non-atomic writer in the
+# whole plan pipeline and the actual source of the repeated 0-byte corruption.
+atomic_cp() { cp "$1" "$2.tmp.$$" && mv -f "$2.tmp.$$" "$2"; }
 if [ -f "$PLAN_DIR/broll_plan.json" ]; then
   if [ ! -f "$SRC_PLAN" ] || ! cmp -s "$PLAN_DIR/broll_plan.json" "$SRC_PLAN"; then
-    cp "$PLAN_DIR/broll_plan.json" "$SRC_PLAN"
+    atomic_cp "$PLAN_DIR/broll_plan.json" "$SRC_PLAN"
     echo "[plan] froze authored plan -> $(basename "$SRC_PLAN")"
   fi
   # Always start each render from the frozen source.
-  cp "$SRC_PLAN" "$PLAN_DIR/broll_plan.json"
+  atomic_cp "$SRC_PLAN" "$PLAN_DIR/broll_plan.json"
 fi
 
 # Lint the plan: every entry needs a `reason`, list entries need items, etc.
@@ -259,7 +281,7 @@ esac
 echo "==> QUALITY=$QUALITY  comp=${RENDER_W}x${RENDER_H}  crf=$RENDER_CRF  preset=$RENDER_PRESET  score=$DO_SCORE"
 
 # Stage assets in remotion/public/<job>/ using hardlinks
-JOB_HASH=$(echo -n "${VIDEO_PATH}|${VARIANT}" | shasum | cut -c1-8)
+JOB_HASH=$(echo -n "${VIDEO_PATH}|${VARIANT}" | sha1sum | cut -c1-8)
 JOB_ID="job-$JOB_HASH"
 PUB="$REMOTION_DIR/public/$JOB_ID"
 rm -rf "$PUB"
@@ -430,11 +452,13 @@ for img_path in needed:
         print(f"[warn] asset not found for: {name}")
         continue
     dst = os.path.join(pub_broll, name)
-    try:
-        os.link(found, dst)
-    except (OSError, FileExistsError):
-        if not os.path.exists(dst):
-            shutil.copyfile(found, dst)
+    # ALWAYS a real copy, never os.link(). A hardlink makes the staged copy
+    # and the original workdir asset the SAME inode — any write Remotion's
+    # own render process makes to "its" staged file (webpack cache churn,
+    # headless Chrome, etc) corrupts the original source asset too. This was
+    # the actual cause of freewater.jpg / kickbacks_demo.png repeatedly
+    # ending up 0 bytes in the workdir, not just in the staging area.
+    shutil.copyfile(found, dst)
     print(f"  staged {name} <- {found}")
 PY
 
@@ -883,9 +907,9 @@ RENDER_FP=$(
       | sort -z | xargs -0 cat 2>/dev/null
     date -r "$VIDEO_PATH" +%s 2>/dev/null
     echo "$QUALITY|$RENDER_W|$RENDER_H|$RENDER_CRF|$RENDER_PRESET|${SCORE:-$DO_SCORE}"
-  } | shasum | cut -c1-16
+  } | sha1sum | cut -c1-16
 )
-FP_FILE="$WORKDIR/.render.fp.$(echo -n "${VARIANT:-_}|$OUT_SUFFIX" | shasum | cut -c1-8)"
+FP_FILE="$WORKDIR/.render.fp.$(echo -n "${VARIANT:-_}|$OUT_SUFFIX" | sha1sum | cut -c1-8)"
 if [ "${FORCE_RENDER:-0}" != "1" ] && [ -f "$OUT_PATH" ] \
    && [ "$(cat "$FP_FILE" 2>/dev/null || true)" = "$RENDER_FP" ]; then
   echo "==> Render skipped — inputs unchanged since last successful render."
@@ -948,9 +972,9 @@ except Exception:
   # bg-feelgood-builder was rejected as "cartoonish/funky"). Same track,
   # every short. Override per-render with MUSIC_TRACK=<filename> for one-offs.
   if [ -n "${MUSIC_TRACK:-}" ]; then
-    MUSIC_PATH="$HOME/.claude/skills/video-edit/music/${MUSIC_TRACK}"
+    MUSIC_PATH="$SKILL_DIR/music/${MUSIC_TRACK}"
   else
-    MUSIC_PATH="$HOME/.claude/skills/video-edit/music/vibehorn-background-music-496933.mp3"
+    MUSIC_PATH="$SKILL_DIR/music/vibehorn-background-music-496933.mp3"
   fi
   # Music speed via atempo. 1.0 = original. >1.0 = faster (no pitch shift).
   # Default 1.0 — bg-feelgood-carefree is already 96 BPM, no speedup needed.
@@ -958,10 +982,26 @@ except Exception:
   if [ -z "${MUSIC_SPEED:-}" ]; then
     export MUSIC_SPEED=1.0
   fi
-  echo "==> Scoring (music: $(basename "$MUSIC_PATH") @ ${MUSIC_SPEED}x + SFX) -> $OUT_PATH"
-  bash "$SKILL_DIR/scripts/score.sh" "$OUT_PATH" "$MUSIC_PATH" "$SCORED_TMP" "$SFX_TRACK"
-  mv "$SCORED_TMP" "$OUT_PATH"
-  echo "==> Done (scored): $OUT_PATH"
+  # Scoring (background music + SFX mixing) is a POLISH step on top of an
+  # already-successfully-composited $OUT_PATH — it must never be allowed to
+  # discard that finished render. Previously score.sh exit'ing 1 (e.g. the
+  # music asset missing on this machine, hardcoded path pointed at a
+  # differently-named skill folder that never existed here) propagated
+  # straight through render.sh's `set -e` and killed the whole script,
+  # even though the correctly-composited video was already sitting at
+  # $OUT_PATH with nothing left to do but add music. A missing optional
+  # asset should never throw away a finished render.
+  if [ ! -f "$MUSIC_PATH" ]; then
+    echo "[warn] music not found at $MUSIC_PATH — shipping $OUT_PATH without background music"
+  else
+    echo "==> Scoring (music: $(basename "$MUSIC_PATH") @ ${MUSIC_SPEED}x + SFX) -> $OUT_PATH"
+    if bash "$SKILL_DIR/scripts/score.sh" "$OUT_PATH" "$MUSIC_PATH" "$SCORED_TMP" "$SFX_TRACK"; then
+      mv "$SCORED_TMP" "$OUT_PATH"
+      echo "==> Done (scored): $OUT_PATH"
+    else
+      echo "[warn] scoring failed; shipping $OUT_PATH without background music"
+    fi
+  fi
 fi
 
 # Record the render fingerprint — a re-run with identical inputs now skips
@@ -973,5 +1013,5 @@ echo "$RENDER_FP" > "$FP_FILE"
 # render's "did the author edit this?" diff check sees the pristine source
 # instead of this run's mutation residue.
 if [ -f "$SRC_PLAN" ]; then
-  cp "$SRC_PLAN" "$PLAN_DIR/broll_plan.json"
+  atomic_cp "$SRC_PLAN" "$PLAN_DIR/broll_plan.json"
 fi

@@ -23,6 +23,17 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Optional per-beat visual treatment (independent of `kind` — see
+# remotion/src/templates/FxLayer.tsx). Any beat may carry an `fx` field.
+FX_NAMES = {
+    "bokeh_circles", "geometric_patterns", "gradient_shift", "grid_pulse",
+    "liquid_wave", "matrix_rain", "noise_grain", "pixel_reveal", "starfield",
+    "camera_shake", "film_burn", "ken_burns", "letterbox_reveal",
+    "parallax_pan", "spotlight_reveal", "vignette_pulse", "whip_pan", "zoom_pulse",
+    "blinds_in", "clock_wipe_in", "cross_dissolve_in", "fade_through_black_in",
+    "iris_in", "morph_in", "push_in", "slide_wipe_in", "zoom_through_in",
+}
+
 VALID_KINDS = {
     # Legacy
     "static", "video", "icon", "list",
@@ -41,9 +52,25 @@ VALID_KINDS = {
     "inline_chart", "ratio_dots", "dashboard_card",
     "kinetic_statement", "concept_build", "network_spread", "command_deck",
     "calendar_months", "layer_stack",
+    "ring_chart", "countdown_reveal", "logo_reveal_hero", "logo_reveal_style", "image_compare_slider", "end_card",
+    "gallery_grid", "image_carousel", "image_zoom_reveal", "masonry_gallery",
+    "photo_stack", "picture_in_picture", "polaroid_frame", "split_panels",
+    "area_chart", "progress_bars", "stat_delta", "comparison_bars",
+    "circular_progress", "bounce_title", "bubble_pop_text", "pop_text",
+    "pulse_text", "text_sweep", "typewriter_text", "list_reveal", "card_flip",
+    "notification_stack", "carousel_3d", "sound_wave",
 }
 # Kinds that need an image_path on disk
-IMAGE_KINDS = {"static", "icon", "video", "ai_image_on_grid", "image_card"}
+IMAGE_KINDS = {"static", "icon", "video", "ai_image_on_grid", "image_card", "logo_reveal_hero", "logo_reveal_style"}
+# Kinds that need an `images` array on disk (each entry validated like image_path).
+ARRAY_IMAGE_KINDS = {"gallery_grid", "image_carousel", "masonry_gallery", "photo_stack"}
+# Kinds with single-image field(s) other than `image_path`.
+SINGLE_IMAGE_FIELDS = {
+    "image_zoom_reveal": ["image"],
+    "polaroid_frame": ["image"],
+    "picture_in_picture": ["main_image", "pip_image"],
+    "split_panels": ["left_image", "right_image"],
+}
 
 
 def probe_aspect(path: Path) -> tuple[int, int] | None:
@@ -95,12 +122,18 @@ def lint(plan_path: Path, source_video: Path | None = None) -> int:
     # are allowed to overlap anything. Only EXCLUSIVE full-frame takeovers must
     # not overlap. A `video` beat with overlay:true is a floating card, NOT a
     # takeover — also non-exclusive.
+    # Same set as NON_TAKEOVER further down (duplicated because this check
+    # runs in an earlier pass) — keep both in sync when a new partial-
+    # overlay kind is added. See NON_TAKEOVER's comment for why this
+    # drifted out of sync with the 64 newly-ported kinds in the first place.
     PARTIAL_KINDS = {
-        "icon", "chapter_bar", "notification_toast", "lower_third", "corner_stat",
+        "icon", "chapter_bar", "notification_toast", "list", "lower_third", "corner_stat",
         "side_panel", "word_pop", "hook_title", "subscribe", "image_card",
-        "headline_card", "bar_overlay", "portrait_burst", "tool_logo_burst",
-        "agent_avatar_burst", "ratio_dots", "inline_chart", "claude_code_terminal",
-        "dashboard_card",
+        "headline_card", "bar_overlay", "bullet_burst", "portrait_burst", "tool_logo_burst",
+        "agent_avatar_burst", "org_diagram", "ratio_dots", "inline_chart", "claude_code_terminal",
+        "dashboard_card", "ring_chart", "image_compare_slider", "circular_progress",
+        "bubble_pop_text", "pop_text", "pulse_text", "text_sweep", "typewriter_text",
+        "notification_stack", "sound_wave",
     }
 
     last_end = -1.0
@@ -110,6 +143,8 @@ def lint(plan_path: Path, source_video: Path | None = None) -> int:
         if kind not in VALID_KINDS:
             errors.append(f"{ctx} unknown kind: {kind!r}")
             continue
+        if b.get("fx") and b["fx"] not in FX_NAMES:
+            errors.append(f"{ctx} unknown fx: {b['fx']!r}")
         if "start_sec" not in b or "end_sec" not in b:
             errors.append(f"{ctx} missing start_sec/end_sec")
             continue
@@ -161,6 +196,31 @@ def lint(plan_path: Path, source_video: Path | None = None) -> int:
                                 f"source is {src_dims[0]}x{src_dims[1]} — will letterbox. "
                                 f"Re-source at source aspect for full-frame fill."
                             )
+
+        def _resolve_image(name: str) -> Path | None:
+            base = os.path.basename(name)
+            search = [plan_dir, plan_dir / "broll", plan_dir.parent,
+                      plan_dir.parent / "broll", plan_dir.parent / "motion"]
+            for d in search:
+                if (d / base).exists():
+                    return d / base
+            return None
+
+        if kind in ARRAY_IMAGE_KINDS:
+            images = b.get("images") or []
+            if not images or not isinstance(images, list):
+                errors.append(f"{ctx} {kind} requires non-empty `images` array")
+            else:
+                for img in images:
+                    if not img or _resolve_image(img) is None:
+                        errors.append(f"{ctx} {kind} image not found on disk: {img!r}")
+
+        for field in SINGLE_IMAGE_FIELDS.get(kind, []):
+            val = b.get(field, "")
+            if not val:
+                errors.append(f"{ctx} {kind} requires non-empty `{field}`")
+            elif _resolve_image(val) is None:
+                errors.append(f"{ctx} {kind} {field} not found on disk: {val!r}")
 
         if kind == "icon":
             anchor = b.get("anchor", "center")
@@ -231,6 +291,20 @@ def lint(plan_path: Path, source_video: Path | None = None) -> int:
             "command_deck":       ["tiles"],
             "calendar_months":    ["caption"],
             "layer_stack":        ["layers"],
+            "ring_chart":         ["segments"],
+            "countdown_reveal":   [],  # steps has a sane default (3,2,1,GO); nothing strictly required
+            "logo_reveal_hero":   ["image_path"],
+            "logo_reveal_style":  ["image_path", "style"],
+            "image_compare_slider": ["before_image", "after_image"],
+            "end_card":           ["title"],
+            "gallery_grid":       ["images"],
+            "image_carousel":     ["images"],
+            "image_zoom_reveal":  ["image"],
+            "masonry_gallery":    ["images"],
+            "photo_stack":        ["images"],
+            "picture_in_picture": ["main_image", "pip_image"],
+            "polaroid_frame":     ["image"],
+            "split_panels":       ["left_image", "right_image"],
             "static":             ["image_path"],
             "video":              ["image_path"],
             "keyword_chips":      ["chips"],
@@ -254,6 +328,22 @@ def lint(plan_path: Path, source_video: Path | None = None) -> int:
             "corner_stat":        ["value"],
             "side_panel":         ["side_items"],
             "word_pop":           ["items"],
+            "area_chart":         ["chart_points"],
+            "progress_bars":      ["bars"],
+            "stat_delta":         ["target", "delta_value"],
+            "comparison_bars":    ["comparison_rows"],
+            "circular_progress":  ["value_pct"],
+            "bounce_title":       ["title"],
+            "bubble_pop_text":    ["quote_text"],
+            "pop_text":           ["quote_text"],
+            "pulse_text":         ["quote_text"],
+            "text_sweep":         ["quote_text"],
+            "typewriter_text":    ["quote_text"],
+            "list_reveal":        ["items"],
+            "card_flip":          ["front_text", "back_text"],
+            "notification_stack": ["notifications"],
+            "carousel_3d":        ["carousel_items"],
+            "sound_wave":         [],  # bar_count has a sane default
             # hook_title checked separately below (flank mode needs different
             # fields than the kicker+title lockup).
             # `list` and `vs_split` checked separately below since they
@@ -342,6 +432,10 @@ def lint(plan_path: Path, source_video: Path | None = None) -> int:
             "side_panel",  # progressive bullet reveal via appear_sec
             "bar_overlay",  # bars stagger by appear_sec, span the enumeration
             "bullet_burst",  # accumulating bullets across rapid-fire list
+            "gallery_grid",  # grid cells stagger in one-by-one
+            "masonry_gallery",  # masonry blocks stagger in one-by-one
+            "image_carousel",  # slides advance through the array over the beat
+            "photo_stack",  # photos stagger in one-by-one
             "vs_split",  # two enumerated sides, reading both takes 8-10s
             "portrait_burst",  # portraits land one-by-one as people are named
             "tool_logo_burst",  # logos land one-by-one as tools are named
@@ -355,6 +449,14 @@ def lint(plan_path: Path, source_video: Path | None = None) -> int:
             "command_deck",  # department tiles boot up one-by-one across the line
             "calendar_months",  # N mini-calendars fill lime in sequence, full span
             "layer_stack",  # architecture slabs build bottom→top across the line
+            "ring_chart",  # segments sweep in sequentially across the beat
+            "countdown_reveal",  # steps tick down at a fixed per-step cadence
+            "progress_bars",  # bars fill in with per-bar stagger, full span
+            "comparison_bars",  # before/after rows stagger in, full span
+            "notification_stack",  # toasts cascade in one-by-one
+            "carousel_3d",  # ring of cards continuously orbits, full span
+            "sound_wave",  # bars animate continuously across the whole beat
+            "list_reveal",  # items stagger in one-by-one, full span
         }
         beat_dur = end - start
         # ── READING-TIME RULE (codified May 23 2026) ──────────────────
@@ -456,11 +558,21 @@ def lint(plan_path: Path, source_video: Path | None = None) -> int:
     # leave the speaker in frame, so they can land in the 0–1.5s window as
     # an attention-flash without covering the speaker (e.g. a logo flash on
     # a brand mention).
+    # This set must mirror EditedVideo.tsx's TAKEOVER_KINDS (inverted) — any
+    # kind NOT in that Set is a partial overlay there. It drifted out of
+    # sync when the 64 newly-ported kinds were added (none of their
+    # partial-overlay ones were added here), which wrongly forced kinds
+    # like tool_logo_burst to obey the full-takeover 1.5s rule even though
+    # they're small partial overlays that leave the speaker in frame.
     NON_TAKEOVER = {
-        "icon", "chapter_bar", "notification_toast",
+        "icon", "chapter_bar", "notification_toast", "list",
         "lower_third", "corner_stat", "side_panel",
         "word_pop", "hook_title", "subscribe", "image_card", "headline_card",
-        "bar_overlay",
+        "bar_overlay", "bullet_burst", "portrait_burst", "tool_logo_burst",
+        "agent_avatar_burst", "org_diagram", "claude_code_terminal", "inline_chart",
+        "ratio_dots", "dashboard_card", "ring_chart", "image_compare_slider",
+        "circular_progress", "bubble_pop_text", "pop_text", "pulse_text",
+        "text_sweep", "typewriter_text", "notification_stack", "sound_wave",
     }
     takeover_plan = [b for b in plan if b.get("kind", "static") not in NON_TAKEOVER and not b.get("overlay")]
     if takeover_plan:

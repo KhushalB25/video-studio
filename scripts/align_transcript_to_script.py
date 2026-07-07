@@ -44,6 +44,7 @@ it is printed under REVIEW for the agent to reconcile. Numbers, ordinary
 words, whole re-phrasings and skipped script lines are always left alone.
 """
 import json
+import os
 import re
 import sys
 from difflib import SequenceMatcher
@@ -253,7 +254,9 @@ def main() -> int:
                            f"   (brand terms: {', '.join(mid_brands)})")
 
     out_data = {"words": out} if isinstance(data, dict) and "words" in data else out
-    words_path.write_text(json.dumps(out_data, indent=2))
+    tmp = words_path.with_suffix(words_path.suffix + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(out_data, indent=2))
+    os.replace(tmp, words_path)
 
     coverage = 100.0 * equal_tokens / max(1, len(words))
     if fixes:
