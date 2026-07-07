@@ -233,7 +233,9 @@ def main() -> int:
 
     print(f"[2/2] Transcribing with WhisperX (model={model_size})")
     words = transcribe(audio_path, model_size)
-    words_json.write_text(json.dumps(words, indent=2))
+    tmp = words_json.with_suffix(words_json.suffix + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(words, indent=2))
+    os.replace(tmp, words_json)  # atomic — a crash mid-write can't leave 0-byte words.json
     print(f"Wrote {len(words)} words -> {words_json}")
     return 0
 

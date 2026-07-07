@@ -855,6 +855,58 @@ Auto-runs after render. Checks:
 - `ZOOM_PUNCH_INTENSITY=1.06` (default) — speaker punch-in scale
 - `ZOOM_EASE_FRAMES=8` (default) — frames to fade zoom in/out
 
+## Extended template library (ported from reactvideoeditor/remotion-templates)
+
+64 additional kinds, ported and wired into rendering, lint, and the studio UI. Use these when a moment calls for a visual none of the original kinds above cover — don't reach for these over an established kind that already fits (e.g. still use `bar_overlay` for discrete comparisons, `tool_logo_burst` for named businesses). Each takes `start_sec`/`end_sec`/`reason` like any beat.
+
+**Charts & data**
+- `area_chart` — filled-area trend under a drawn line. Use for cumulative/growing-total moments ("total users climbed all year") where `inline_chart`'s bare line undersells the growth. `{kind:"area_chart", title?, data:[n,...], labels?:[...]}`
+- `progress_bars` — multiple horizontal skill/metric bars filling in parallel, staggered. Use for "here's how we rank on X, Y, Z" multi-metric moments (not a single before/after — that's `comparison_bars`). `{kind:"progress_bars", title?, bars:[{label,value,max?}]}`
+- `stat_delta` — big number count-up PLUS an inline delta/sub-stat row (e.g. "↑12.5% this month"). Use over `metric_reveal` specifically when the speaker also names a rate-of-change alongside the headline number. `{kind:"stat_delta", value:n, label, delta?, delta_label?}`
+- `comparison_bars` — two bars side-by-side, before/after. Use for a single explicit before→after metric swing ("$4k to $40k MRR"). `{kind:"comparison_bars", before:{label,value}, after:{label,value}, title?}`
+- `circular_progress` — ring meter with center %. Use for a single completion/capacity stat ("we're at 80% of target") where a percentage-as-ring reads cleaner than a number alone. `{kind:"circular_progress", value:0-100, label?}`
+
+**Text emphasis**
+- `bounce_title` — title+subtitle spring bounce entrance. Alt texture to `hook_title` for a punchier, less composed cold-open feel.
+- `bubble_pop_text` — characters pop into circular chip bubbles. Playful/casual register — use sparingly, breaks the premium feel if overused.
+- `pop_text` — character-by-character scale-pop with neon glow. High-energy emphasis moment, louder than `word_pop`.
+- `pulse_text` — continuous scale pulse with blur halo. For a word that should feel alive/urgent while it's on screen (not just entering).
+- `text_sweep` — word-by-word progressive highlight/underline sweep. Use when the speaker's cadence IS the reveal (reading a list rhythmically) — the highlight tracks pace.
+- `typewriter_text` — character-by-character typing with blinking cursor. Use for "typing"/CLI/messaging register moments distinct from `claude_code_terminal` (no terminal chrome, just raw typed text).
+- All take `{kind, text or items, vertical?, beat_start_sec}` — check the component file for exact prop name per kind.
+
+**Content/list animation**
+- `list_reveal` — staggered list-item slide/scale/fade entrance. Alt texture to `bulleted_list` for a punchier arrival.
+- `card_flip` — 3D flip revealing front/back. Use for a "before you knew X / now you know Y" reveal beat, or naming-then-defining a term.
+- `notification_stack` — MULTIPLE toast notifications stacking in with an unread badge. Use for "I got flooded with messages/alerts" moments — distinct from single `notification_toast` (one alert).
+- `carousel_3d` — 3D circular-orbit card carousel. Use for "here are several options/tools I tried" where a flat grid feels static.
+- `sound_wave` — animated audio waveform bars. Use for literal audio/podcast/voice moments ("here's what that sounded like").
+
+**Logo & branding**
+- `logo_reveal_style` — 8 alternate entrance animations for a single brand/logo reveal (blur, bounce, fade, glitch, scale_rotate, split, stroke_draw, typewriter), via a `style` field. Use instead of `logo_reveal_hero` when you want a different entrance texture for variety across a video with multiple brand reveals — don't use the same style twice in one video. `{kind:"logo_reveal_style", image_path, name?, tagline?, style:"blur"|"bounce"|"fade"|"glitch"|"scale_rotate"|"split"|"stroke_draw"|"typewriter"}`
+
+**Image & media layouts**
+- `gallery_grid` — staggered grid of multiple images. Use for "here are several examples/screenshots" moments where one `image_card` isn't enough.
+- `image_carousel` — horizontal sliding carousel, center image emphasized. Use for a sequence of images the speaker is walking through one at a time.
+- `image_zoom_reveal` — image scales from 2x + unblurs, caption fades over it. Use for a dramatic single-image reveal moment ("and here's what it actually looked like").
+- `masonry_gallery` — Pinterest-style varied-size grid. Use for a loose collection of visuals without a strict sequence (mood board register).
+- `photo_stack` — 3 overlapping polaroid-style photos, staggered. Use for "a few moments/memories" — more intimate/scrapbook than `gallery_grid`.
+- `picture_in_picture` — small inset window over a background. Use when the speaker references watching/monitoring something WHILE talking about something else (rare — most speaker footage IS the main layer already).
+- `polaroid_frame` — single polaroid-style photo drop-in. Use for one nostalgic/personal photo moment, lighter treatment than `image_card`.
+- `split_panels` — two free-form panels sliding in from edges to meet at center. Use for showing two DIFFERENT artifacts side-by-side with no data/label list (if there's a labeled list of items per side, that's the banned `vs_split` — don't use either for a data comparison; use `comparison_bars` or `bar_overlay` instead).
+
+All image-bearing kinds above resolve `image_path`/`images[]` the same way as `image_card` — existing-file check enforced by lint.
+
+## Optional per-beat `fx` field — visual treatments layered on ANY kind
+
+Independent of `kind`. Any beat can add `"fx": "<name>"` to layer a treatment on top of whatever it already renders. Full list defined in [FxLayer.tsx](remotion/src/templates/FxLayer.tsx) and `FX_NAMES` in [lint_plan.py](scripts/lint_plan.py). Use very sparingly — one or two per video max, these are texture, not content:
+
+- **Ambient background** (subtle, low-opacity, runs the whole beat): `bokeh_circles`, `geometric_patterns`, `gradient_shift`, `grid_pulse`, `liquid_wave`, `matrix_rain`, `noise_grain`, `pixel_reveal`, `starfield`
+- **Cinematic treatment** (whole beat): `camera_shake` (impact moment), `film_burn`, `ken_burns` (slow push-in over the beat), `letterbox_reveal`, `parallax_pan`, `spotlight_reveal`, `vignette_pulse`, `whip_pan`, `zoom_pulse`
+- **Entrance wipe** (first ~0.5s only, reinterpreted from the source repo's scene-transition templates since we don't crossfade between two different beats): `blinds_in`, `clock_wipe_in`, `cross_dissolve_in`, `fade_through_black_in`, `iris_in`, `morph_in`, `push_in`, `slide_wipe_in`, `zoom_through_in`
+
+Example: a hard cut into a dramatic reveal beat might use `{"kind":"stat_delta", ..., "fx":"iris_in"}` to wipe it into view instead of a flat cut.
+
 ## When NOT to use this skill
 
 - Source needs cutting / silence removal / take dedup → **legacy mode** removed; use a different tool

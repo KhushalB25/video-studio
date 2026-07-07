@@ -235,7 +235,9 @@ def main() -> int:
         return 0
     applied = apply_corrections(words, fixes)
     if applied:
-        words_path.write_text(json.dumps(words, indent=2))
+        tmp = words_path.with_suffix(words_path.suffix + f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps(words, indent=2))
+        os.replace(tmp, words_path)
         print(f"[polish] wrote {applied} correction(s) to {words_path}")
     return 0
 

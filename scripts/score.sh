@@ -35,10 +35,12 @@ if [ -z "${1:-}" ]; then
   exit 2
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 INPUT="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
-MUSIC_ARG="${2:-$HOME/.claude/skills/video-edit/music}"
+MUSIC_ARG="${2:-$SKILL_DIR/music}"
 OUT="${3:-${INPUT%.mp4}.scored.mp4}"
-SFX="${4:-$HOME/.claude/skills/video-edit/sfx/flare-hit.mp3}"
+SFX="${4:-$SKILL_DIR/sfx/flare-hit.mp3}"
 
 # Resolve music: if dir, pick deterministically by input filename hash
 if [ -d "$MUSIC_ARG" ]; then

@@ -20,9 +20,18 @@ Idempotent. Run after sync_list_items.py and before close_gaps.py.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
+
+
+def write_json_atomic(path: Path, text: str) -> None:
+    """Write-then-rename so a crash mid-write (or a race with another render)
+    can never leave a truncated broll_plan.json on disk."""
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 LEAD_SEC = 0.10  # how early the visual lands relative to first spoken word
 TAIL_SEC = 0.80  # how long the visual lingers past the last spoken word.
@@ -100,6 +109,32 @@ SEQUENCE_KINDS = {
     # layer_stack — architecture slabs build bottom→top across the spoken
     # enumeration; the whole authored span is the build.
     "layer_stack",
+    # ring_chart — segments sweep in sequentially across the beat; the whole
+    # authored span is the reveal choreography, not one anchor word.
+    "ring_chart",
+    # countdown_reveal — steps tick down across the authored span at a fixed
+    # per-step cadence; shortening it would truncate mid-count.
+    "countdown_reveal",
+    # gallery_grid — grid cells stagger in one-by-one across the beat.
+    "gallery_grid",
+    # masonry_gallery — masonry blocks stagger in one-by-one across the beat.
+    "masonry_gallery",
+    # image_carousel — slides advance through the array across the whole beat.
+    "image_carousel",
+    # photo_stack — photos stagger in one-by-one across the beat.
+    "photo_stack",
+    # progress_bars — bars fill in with per-bar stagger across the whole beat.
+    "progress_bars",
+    # comparison_bars — before/after rows stagger in across the whole beat.
+    "comparison_bars",
+    # notification_stack — toasts cascade in one-by-one across the beat.
+    "notification_stack",
+    # carousel_3d — ring of cards continuously orbits for the whole beat.
+    "carousel_3d",
+    # sound_wave — waveform bars animate continuously across the whole beat.
+    "sound_wave",
+    # list_reveal — items stagger in one-by-one, the authored span is the reveal.
+    "list_reveal",
 }
 
 PUNCT_RE = re.compile(r"[^\w\s'-]")
@@ -257,7 +292,7 @@ def align(plan_path: Path, words_path: Path) -> int:
                     b["end_sec"] = new_end
                 print(f"    quote_pull cadence: {cps} chars/sec (text {len(text)} chars over ~{effective:.2f}s)")
 
-    plan_path.write_text(json.dumps(plan, indent=2) + "\n")
+    write_json_atomic(plan_path, json.dumps(plan, indent=2) + "\n")
     print(f"aligned {moved} beat(s) to speech in {plan_path}")
     return 0
 

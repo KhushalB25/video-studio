@@ -96,7 +96,7 @@ const LowerThirdLine: React.FC<{ line: CaptionLine }> = ({ line }) => {
   // Anchor near the very bottom — on shorts this keeps the caption band BELOW
   // the word_pop lower-third lane (~0.72) so caption + word_pop don't collide.
   // Still lifted enough to clear the mobile safe area / scrub bar.
-  const bottomOffset = Math.round(height * (line.bottom_offset ?? (isLandscape ? 0.14 : 0.16)));
+  const bottomOffset = Math.round(height * (line.bottom_offset ?? (isLandscape ? 0.14 : 0.215)));
 
   // Inside the per-line <Sequence>, useCurrentFrame() is RELATIVE (0 = line
   // start) — so the fade-in must key off 0, not line.start_sec (an absolute

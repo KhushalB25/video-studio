@@ -32,8 +32,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from pathlib import Path
+
+
+def write_json_atomic(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    tmp.write_text(text)
+    os.replace(tmp, path)
 
 # Tuneables
 MAX_WORDS_PER_LINE = 6        # caption legibility cap
@@ -228,7 +235,7 @@ def main():
 
     words = json.load(open(args.words_json))
     if not isinstance(words, list) or not words:
-        Path(args.out_json).write_text("[]")
+        write_json_atomic(Path(args.out_json), "[]")
         print(f"[captions] empty words.json — wrote []")
         return
 
@@ -259,7 +266,7 @@ def main():
     lines = group_words_to_lines(words, forced_breaks=forced)
     lines = mark_emphasis_lines(lines, emph_ranges, emph_styles=styles)
 
-    Path(args.out_json).write_text(json.dumps(lines, indent=2))
+    write_json_atomic(Path(args.out_json), json.dumps(lines, indent=2))
     n_emph = sum(1 for ln in lines if ln.get("emphasis"))
     print(f"[captions] wrote {len(lines)} lines ({n_emph} emphasis) -> {args.out_json}")
 

@@ -83,7 +83,11 @@ def main() -> int:
         return 2
 
     video_path = Path(sys.argv[1]).expanduser().resolve()
-    wd = workdir_for(video_path)
+    # Same digest formula render.sh's bash and this script's Python can land
+    # on different workdirs for the "same" path (path normalization differs
+    # across languages). Trust the caller's explicit workdir when given.
+    override = os.environ.get("STUDIO_WORKDIR")
+    wd = Path(override) if override else workdir_for(video_path)
     words_json = wd / "words.json"
     if not words_json.exists():
         print(f"missing {words_json} — run transcribe.py first", file=sys.stderr)
