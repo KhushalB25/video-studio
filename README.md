@@ -1,6 +1,3 @@
-# video-edit skill
-
-A Claude Code skill for editing YouTube videos. Built by Luuk Alleman.
 
 ## What's inside
 
