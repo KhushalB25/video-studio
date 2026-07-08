@@ -26,6 +26,3 @@
 4. **Quick test:**
    In Claude Code: invoke the skill with a video path and see what happens.
 
-## Questions?
-
-Reach out at luuk@alleman.nl or via the chat at build-loop.ai.
