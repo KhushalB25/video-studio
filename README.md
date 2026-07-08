@@ -1,34 +1,33 @@
-# video-edit skill
+# Video Studio
 
-A Claude Code skill for editing YouTube videos. Built by Luuk Alleman.
+A local video editor that edits itself. Drop in a raw talking-head video, open the web UI, and it transcribes, cuts silence, stabilizes, tracks your face, adds captions and motion graphics, and scores music/SFX — all on your own machine.
 
-## What's inside
+**Nothing gets uploaded.** The video never leaves your computer, and no third-party editing service is involved. Claude is the only outside intelligence in the loop, and it never touches the video file itself — it just reads a transcript and writes a small JSON edit plan that the local pipeline (ffmpeg, Whisper, Remotion, MediaPipe) executes.
 
-- `SKILL.md` — the prompt Claude uses to orchestrate edits
-- `knowledge/` — recipes, style guides, editing rules, music library reference
-- `scripts/` — Python + bash helpers Claude calls (transcript polish, b-roll fetch, render, etc.)
-- `assets/` — brand assets used in renders (logos, subscribe bug)
+## How it works
+
+1. **Drop a video** into the Studio UI. It's transcribed locally (Whisper) and roughly cut.
+2. **Tell it what you want**, in plain English, in the prompt queue panel.
+3. **Claude reads the transcript + your prompt** and writes/updates an edit plan (captions, b-roll beats, camera moves, callouts, subscribe CTA, etc.) as JSON.
+4. **The pipeline renders it** — ffmpeg handles cutting/stabilizing/camera movement, Remotion composites captions and graphics, audio gets scored with music + SFX.
+5. **Iterate** — tweak the plan, re-render, export when it looks right. Nothing here requires leaving the app or sending the video anywhere.
+
+## Run it
+
+```
+python3 scripts/studio.py
+```
+
+Open `http://localhost:5000`. Tabs: **Clean** (trim/stabilize/camera) → **Edit** (captions, b-roll, beats) → **Export**.
 
 ## Setup
 
-1. **Drop the folder into `~/.claude/skills/`** so Claude Code picks it up:
-   ```
-   mv video-edit ~/.claude/skills/
-   ```
+- ffmpeg, local Whisper, Remotion, and MediaPipe installed (see each tool's own install docs)
+- `PEXELS_API_KEY` — optional, only used as a stock-footage fallback when no real screenshot/asset exists ([free key](https://www.pexels.com/api/))
+- Claude Code running locally to author edit plans from the prompt queue
 
-2. **Environment variables** the scripts expect (set in your shell or `.env`):
-   - `PEXELS_API_KEY` — free at https://www.pexels.com/api/
-   - `ANTHROPIC_API_KEY` — for `polish_transcript.py`
-   - `OPENAI_API_KEY` — used by some scripts
+That's it — no other API keys, no cloud render step, no external editing tool.
 
-3. **NOT included in this download:**
-   - `remotion/` — the Remotion render engine (491MB, install separately: https://www.remotion.dev/)
-   - `music/`, `sfx/` — copyrighted; bring your own library
-   - `config/youtube_upload_token.json` — generate your own via Google Cloud Console + the YouTube Data API OAuth flow
+## Why local-only matters
 
-4. **Quick test:**
-   In Claude Code: invoke the skill with a video path and see what happens.
-
-## Questions?
-
-Reach out at luuk@alleman.nl or via the chat at build-loop.ai.
+Talking-head video is personal. This tool was built so editing it never means handing it to a hosted service: everything lives in a local cache folder on disk, every render happens on your CPU/GPU, and the only "AI" involved is Claude deciding *what* to place where — not a cloud pipeline processing your footage.
